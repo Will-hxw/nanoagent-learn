@@ -547,7 +547,7 @@ def main():
 
     # 打印启动界面
     print(f"\n{Colors.BOLD}{Colors.HEADER}╭─────────────────────────────────────────────────────────────────────────────╮{Colors.ENDC}")
-    print(f"{Colors.BOLD}{Colors.HEADER}│  🤖  Agent  ·  AI 学习工具                                    HuaXiaowei   │{Colors.ENDC}")
+    print(f"{Colors.BOLD}{Colors.HEADER}│  🤖  Agent  ·  AI 学习工具                                    HuaXiaowei    │{Colors.ENDC}")
     print(f"{Colors.BOLD}{Colors.HEADER}╰─────────────────────────────────────────────────────────────────────────────╯{Colors.ENDC}\n")
 
     # 模式选择
