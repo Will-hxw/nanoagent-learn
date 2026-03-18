@@ -306,6 +306,62 @@ def process_tool_call(tool_name: str, tool_input: dict) -> str:
 
 
 # ============================================================================
+# 上下文管理
+# ============================================================================
+
+def truncate_tool_result(result: str, max_chars: int = 30000) -> str:
+    """截断过长的工具返回结果，保留头尾各一半"""
+    if len(result) <= max_chars:
+        return result
+    half = max_chars // 2
+    return (
+        result[:half]
+        + f"\n\n... [内容过长已截断：原始 {len(result)} 字符，保留前后各 {half} 字符] ...\n\n"
+        + result[-half:]
+    )
+
+
+def estimate_tokens(messages: list, system_prompt: str = "") -> int:
+    """粗略估算 token 数，1 token ≈ 3 字符（偏保守，适合中英混合）"""
+    total_chars = len(system_prompt)
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    total_chars += len(json.dumps(item, ensure_ascii=False))
+                else:
+                    total_chars += len(str(item))
+    return total_chars // 3
+
+
+def trim_history(messages: list, system_prompt: str, token_budget: int = 150000) -> list:
+    """超预算时裁剪早期历史，保留最近对话"""
+    current = estimate_tokens(messages, system_prompt)
+    if current <= token_budget:
+        return messages
+
+    print(f"\n{Colors.YELLOW}[上下文管理] 预估 {current} tokens，超过预算 {token_budget}，开始裁剪...{Colors.ENDC}")
+
+    summary = {
+        "role": "user",
+        "content": "[系统提示：之前的对话历史因上下文长度限制已被省略，请基于后续消息继续对话。]"
+    }
+
+    keep_min = min(10, len(messages))
+    trimmed = [summary] + messages[-keep_min:]
+
+    while estimate_tokens(trimmed, system_prompt) > token_budget and keep_min > 2:
+        keep_min -= 2
+        trimmed = [summary] + messages[-keep_min:]
+
+    print(f"{Colors.YELLOW}[上下文管理] 裁剪完成，保留 {len(trimmed)} 条消息（含摘要占位）{Colors.ENDC}")
+    return trimmed
+
+
+# ============================================================================
 # Agent 核心
 # ============================================================================
 
@@ -353,24 +409,42 @@ def build_system_prompt() -> str:
 
 
 def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
-    global call_count
+    global call_count, conversation_history
     all_tools = tools + mcp_manager.get_tool_definitions()
 
     conversation_history.append({"role": "user", "content": user_message})
+    conversation_history = trim_history(conversation_history, build_system_prompt())
+
+    def safe_api_call():
+        global conversation_history
+        try:
+            return client.messages.create(
+                model=model,
+                max_tokens=2048,
+                system=build_system_prompt(),
+                tools=all_tools,
+                messages=conversation_history
+            )
+        except anthropic.BadRequestError:
+            print(f"\n{Colors.RED}[上下文溢出] API 返回 400，强制裁剪历史重试...{Colors.ENDC}")
+            conversation_history = trim_history(
+                conversation_history, build_system_prompt(), token_budget=80000
+            )
+            return client.messages.create(
+                model=model,
+                max_tokens=2048,
+                system=build_system_prompt(),
+                tools=all_tools,
+                messages=conversation_history
+            )
+        except anthropic.PermissionDeniedError:
+            print(f"\n{Colors.RED}{Colors.BOLD}API欠费失效，请联系xiaoweihuacqu@gamil.com{Colors.ENDC}\n")
+            return None
 
     call_count += 1
     print_context(conversation_history, all_tools, call_count, model)
-
-    try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=2048,
-            system=build_system_prompt(),
-            tools=all_tools,
-            messages=conversation_history
-        )
-    except anthropic.PermissionDeniedError:
-        print(f"\n{Colors.RED}{Colors.BOLD}API欠费失效，请联系xiaoweihuacqu@gamil.com{Colors.ENDC}\n")
+    response = safe_api_call()
+    if response is None:
         return ""
     print_response(response, call_count)
 
@@ -383,6 +457,7 @@ def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
                 print(f"\n{Colors.BOLD}{Colors.CYAN}🔧 执行工具: {block.name}{Colors.ENDC}")
                 print(f"{Colors.CYAN}   工作目录: {_cwd}{Colors.ENDC}")
                 tool_result = process_tool_call(block.name, block.input)
+                tool_result = truncate_tool_result(tool_result)
                 print(f"{Colors.GREEN}✓ 工具执行结果:{Colors.ENDC}\n{tool_result}\n")
                 tool_results.append({
                     "type": "tool_result",
@@ -391,20 +466,12 @@ def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
                 })
 
         conversation_history.append({"role": "user", "content": tool_results})
+        conversation_history = trim_history(conversation_history, build_system_prompt())
 
         call_count += 1
         print_context(conversation_history, all_tools, call_count, model)
-
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=2048,
-                system=build_system_prompt(),
-                tools=all_tools,
-                messages=conversation_history
-            )
-        except anthropic.PermissionDeniedError:
-            print(f"\n{Colors.RED}{Colors.BOLD}API欠费，请联系xiaoweihuacqu@gamil.com{Colors.ENDC}\n")
+        response = safe_api_call()
+        if response is None:
             return ""
         print_response(response, call_count)
 
@@ -441,14 +508,15 @@ def main():
 
     print("\n功能说明：")
     print("  • 支持多轮对话，维护完整对话历史")
-    print("  • 执行CMD命令")
-    print("  • 读取文件（自动识别编码）")
-    print("  • 写入文件")
-    print("  • 读取网页内容")
-    print("  • 进行网络搜索")
+    print("  • 执行CMD命令（subprocess + 持久工作目录）")
+    print("  • 读取文件（chardet 自动识别编码，支持 UTF-8/GBK 等）")
+    print("  • 写入文件（原生 open 写入，避免 shell 重定向编码问题）")
+    print("  • 读取网页内容（Jina Reader API 转 Markdown）")
+    print("  • 进行网络搜索（Tavily Search API）")
+    print("  • 上下文管理（自动估算 token，超预算时裁剪早期历史）")
     mcp_tools = mcp_manager.get_tool_definitions()
     if mcp_tools:
-        print(f"  • MCP 工具（{len(mcp_tools)} 个来自远程服务器）")
+        print(f"  • MCP 工具（{len(mcp_tools)} 个来自远程服务器，动态注册到工具列表）")
     print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.ENDC}\n")
     print("输入 'exit' 退出\n")
 
@@ -461,7 +529,13 @@ def main():
             continue
 
         print(f"\n{Colors.BOLD}{Colors.YELLOW}Agent 处理中...{Colors.ENDC}")
-        response = chat(user_input)
+        try:
+            response = chat(user_input)
+        except Exception as e:
+            print(f"\n{Colors.RED}发生错误: {e}{Colors.ENDC}")
+            print(f"{Colors.YELLOW}已清空对话历史，请重新开始。{Colors.ENDC}")
+            conversation_history.clear()
+            continue
 
         print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*80}")
         print("🎯 最终回复")
