@@ -27,6 +27,7 @@ import warnings
 warnings.filterwarnings("ignore")
 import requests
 import chardet
+from mcp_client import mcp_manager
 
 class Colors:
     HEADER = '\033[95m'
@@ -206,7 +207,7 @@ def execute_bash(command: str) -> str:
             shell=True,
             capture_output=True,
             cwd=_cwd,
-            timeout=60,
+            timeout=30,
         )
         def decode_bytes(b):
             if not b:
@@ -218,7 +219,7 @@ def execute_bash(command: str) -> str:
         return output.strip() or "命令执行成功，无输出"
 
     except subprocess.TimeoutExpired:
-        return "命令执行超时（60s）"
+        return "命令执行超时（30s）"
     except Exception as e:
         return f"执行错误: {str(e)}"
 
@@ -299,6 +300,8 @@ def process_tool_call(tool_name: str, tool_input: dict) -> str:
         return execute_web_fetch(tool_input["url"])
     if tool_name == "web_search":
         return execute_web_search(tool_input["query"], tool_input.get("num_results", 15))
+    if mcp_manager.is_mcp_tool(tool_name):
+        return mcp_manager.call_tool(tool_name, tool_input)
     return "未知工具"
 
 
@@ -351,19 +354,24 @@ def build_system_prompt() -> str:
 
 def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
     global call_count
+    all_tools = tools + mcp_manager.get_tool_definitions()
 
     conversation_history.append({"role": "user", "content": user_message})
 
     call_count += 1
-    print_context(conversation_history, tools, call_count, model)
+    print_context(conversation_history, all_tools, call_count, model)
 
-    response = client.messages.create(
-        model=model,
-        max_tokens=2048,
-        system=build_system_prompt(),
-        tools=tools,
-        messages=conversation_history
-    )
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            system=build_system_prompt(),
+            tools=all_tools,
+            messages=conversation_history
+        )
+    except anthropic.PermissionDeniedError:
+        print(f"\n{Colors.RED}{Colors.BOLD}API欠费失效，请联系xiaoweihuacqu@gamil.com{Colors.ENDC}\n")
+        return ""
     print_response(response, call_count)
 
     while response.stop_reason == "tool_use":
@@ -385,15 +393,19 @@ def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
         conversation_history.append({"role": "user", "content": tool_results})
 
         call_count += 1
-        print_context(conversation_history, tools, call_count, model)
+        print_context(conversation_history, all_tools, call_count, model)
 
-        response = client.messages.create(
-            model=model,
-            max_tokens=2048,
-            system=build_system_prompt(),
-            tools=tools,
-            messages=conversation_history
-        )
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=2048,
+                system=build_system_prompt(),
+                tools=all_tools,
+                messages=conversation_history
+            )
+        except anthropic.PermissionDeniedError:
+            print(f"\n{Colors.RED}{Colors.BOLD}API欠费，请联系xiaoweihuacqu@gamil.com{Colors.ENDC}\n")
+            return ""
         print_response(response, call_count)
 
     final_response = "".join(block.text for block in response.content if hasattr(block, "text"))
@@ -423,13 +435,20 @@ def main():
     print(f"{'='*80}{Colors.ENDC}")
     print_environment_info()
 
-    print("功能说明：")
+    # 连接 MCP 服务器
+    print(f"{Colors.BOLD}{Colors.CYAN}🔌 连接 MCP 服务器...{Colors.ENDC}")
+    mcp_manager.init_servers()
+
+    print("\n功能说明：")
     print("  • 支持多轮对话，维护完整对话历史")
     print("  • 执行CMD命令")
     print("  • 读取文件（自动识别编码）")
     print("  • 写入文件")
     print("  • 读取网页内容")
     print("  • 进行网络搜索")
+    mcp_tools = mcp_manager.get_tool_definitions()
+    if mcp_tools:
+        print(f"  • MCP 工具（{len(mcp_tools)} 个来自远程服务器）")
     print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.ENDC}\n")
     print("输入 'exit' 退出\n")
 
