@@ -174,8 +174,8 @@ tools = [
                 },
                 "num_results": {
                     "type": "integer",
-                    "description": "返回结果数量（1-20），默认10",
-                    "default": 10
+                    "description": "返回结果数量（1-20），默认15",
+                    "default": 15
                 }
             },
             "required": ["query"]
@@ -263,7 +263,7 @@ def execute_web_fetch(url: str) -> str:
         return f"读取错误: {str(e)}"
 
 
-def execute_web_search(query: str, num_results: int = 10) -> str:
+def execute_web_search(query: str, num_results: int = 15) -> str:
     try:
         resp = requests.post(
             "https://api.tavily.com/search",
@@ -298,7 +298,7 @@ def process_tool_call(tool_name: str, tool_input: dict) -> str:
     if tool_name == "web_fetch":
         return execute_web_fetch(tool_input["url"])
     if tool_name == "web_search":
-        return execute_web_search(tool_input["query"], tool_input.get("num_results", 10))
+        return execute_web_search(tool_input["query"], tool_input.get("num_results", 15))
     return "未知工具"
 
 
