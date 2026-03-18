@@ -7,11 +7,26 @@ Agent 学习工具 - 可视化展示Agent工作原理
 5. 如果响应是end_turn → 返回最终答案给用户
 """
 
+import sys
+import os
+import io
+
+# 必须最先执行：切换 CMD 代码页到 UTF-8，确保双击 exe 也生效
+os.system("chcp 65001 >nul 2>&1")
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='replace')
+
 import anthropic
 import subprocess
 import json
-import os
 import locale
+import urllib.request
+import warnings
+warnings.filterwarnings("ignore")
+import requests
+import chardet
 
 class Colors:
     HEADER = '\033[95m'
@@ -33,7 +48,7 @@ call_count = 0
 # 当前工作目录，跨命令持久化，支持 cd 切换
 _cwd = os.getcwd()
 
-# CMD 输出编码（GBK/CP936 等），避免乱码
+# chcp 65001 之后取值，反映实际代码页；fallback 用 utf-8
 _encoding = locale.getpreferredencoding(False) or 'utf-8'
 
 
@@ -124,6 +139,47 @@ tools = [
             },
             "required": ["path", "content"]
         }
+    },
+    {
+        "name": "read_file",
+        "description": "读取本地文件内容。自动检测文件编码（UTF-8、GBK等），确保中文正确显示。读取文件请优先使用此工具而非 bash + type。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "文件路径，相对路径基于当前工作目录"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "web_fetch",
+        "description": "Read and extract clean content from any URL using Jina Reader. Returns markdown-formatted text. Good for reading web pages, articles, documentation.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The URL to read and extract content from"}
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "web_search",
+        "description": "搜索互联网获取最新信息。返回搜索结果包含标题、URL和内容摘要。适用于查询实时信息、技术文档、新闻等。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索关键词"
+                },
+                "num_results": {
+                    "type": "integer",
+                    "description": "返回结果数量（1-20），默认10",
+                    "default": 10
+                }
+            },
+            "required": ["query"]
+        }
     }
 ]
 
@@ -151,10 +207,14 @@ def execute_bash(command: str) -> str:
             capture_output=True,
             cwd=_cwd,
             timeout=60,
-            encoding=_encoding,
-            errors='replace'
         )
-        output = (result.stdout or "") + (result.stderr or "")
+        def decode_bytes(b):
+            if not b:
+                return ""
+            detected = chardet.detect(b)
+            enc = detected.get("encoding") or _encoding
+            return b.decode(enc, errors='replace')
+        output = decode_bytes(result.stdout) + decode_bytes(result.stderr)
         return output.strip() or "命令执行成功，无输出"
 
     except subprocess.TimeoutExpired:
@@ -176,11 +236,69 @@ def execute_write_file(path: str, content: str) -> str:
         return f"写入错误: {str(e)}"
 
 
+def execute_read_file(path: str) -> str:
+    try:
+        full_path = path if os.path.isabs(path) else os.path.join(_cwd, path)
+        if not os.path.isfile(full_path):
+            return f"文件不存在: {full_path}"
+        with open(full_path, 'rb') as f:
+            raw = f.read()
+        if not raw:
+            return "（空文件）"
+        detected = chardet.detect(raw)
+        enc = detected.get("encoding") or 'utf-8'
+        return raw.decode(enc, errors='replace')
+    except Exception as e:
+        return f"读取错误: {str(e)}"
+
+
+def execute_web_fetch(url: str) -> str:
+    try:
+        jina_url = f"https://r.jina.ai/{url}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        resp = requests.get(jina_url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        return f"读取错误: {str(e)}"
+
+
+def execute_web_search(query: str, num_results: int = 10) -> str:
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": "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",
+                "query": query,
+                "search_depth": "advanced",
+                "max_results": num_results
+            },
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            return "未找到相关结果"
+        output = []
+        for i, r in enumerate(results, 1):
+            output.append(f"{i}. {r.get('title', '无标题')}\n   URL: {r.get('url', '')}\n   {r.get('content', '')}")
+        return "\n\n".join(output)
+    except Exception as e:
+        return f"搜索错误: {str(e)}"
+
+
 def process_tool_call(tool_name: str, tool_input: dict) -> str:
     if tool_name == "bash":
         return execute_bash(tool_input["command"])
     if tool_name == "write_file":
         return execute_write_file(tool_input["path"], tool_input["content"])
+    if tool_name == "read_file":
+        return execute_read_file(tool_input["path"])
+    if tool_name == "web_fetch":
+        return execute_web_fetch(tool_input["url"])
+    if tool_name == "web_search":
+        return execute_web_search(tool_input["query"], tool_input.get("num_results", 10))
     return "未知工具"
 
 
@@ -300,12 +418,18 @@ def print_environment_info():
 def main():
     print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}")
     print("🤖 Agent 真实工作流学习工具 -HuaXiaowei")
+    print("")
+    print("每次API调用都会打印完整的JSON请求和响应")
     print(f"{'='*80}{Colors.ENDC}")
     print_environment_info()
+
     print("功能说明：")
-    print("  • 每次API调用都会打印完整的JSON请求和响应")
     print("  • 支持多轮对话，维护完整对话历史")
-    print("  • bash 工具执行 CMD 命令，write_file 工具写入文件")
+    print("  • 执行CMD命令")
+    print("  • 读取文件（自动识别编码）")
+    print("  • 写入文件")
+    print("  • 读取网页内容")
+    print("  • 进行网络搜索")
     print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.ENDC}\n")
     print("输入 'exit' 退出\n")
 
