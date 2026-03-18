@@ -299,7 +299,7 @@ def print_environment_info():
 
 def main():
     print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}")
-    print("🤖 Agent 真实工作流学习工具")
+    print("🤖 Agent 真实工作流学习工具 -HuaXiaowei")
     print(f"{'='*80}{Colors.ENDC}")
     print_environment_info()
     print("功能说明：")
