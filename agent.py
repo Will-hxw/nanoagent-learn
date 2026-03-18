@@ -231,7 +231,7 @@ def build_system_prompt() -> str:
     )
 
 
-def chat(user_message: str, model: str = "gpt-5.1-codex-mini") -> str:
+def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
     global call_count
 
     conversation_history.append({"role": "user", "content": user_message})
