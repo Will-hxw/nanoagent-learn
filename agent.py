@@ -27,6 +27,8 @@ import warnings
 warnings.filterwarnings("ignore")
 import requests
 import chardet
+import time
+import threading
 from mcp_client import mcp_manager
 
 class Colors:
@@ -51,6 +53,9 @@ _cwd = os.getcwd()
 
 # chcp 65001 之后取值，反映实际代码页；fallback 用 utf-8
 _encoding = locale.getpreferredencoding(False) or 'utf-8'
+
+# 运行模式：'json' 或 'chat'
+_display_mode = 'chat'
 
 
 # ============================================================================
@@ -77,6 +82,8 @@ def serialize_content(content):
 
 
 def print_context(messages: list, tools: list, call_num: int, model: str):
+    if _display_mode != 'json':
+        return
     print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*80}")
     print(f"📤 第 {call_num} 次 API 调用 - 发送给API的完整请求")
     print(f"{'='*80}{Colors.ENDC}\n")
@@ -91,6 +98,8 @@ def print_context(messages: list, tools: list, call_num: int, model: str):
 
 
 def print_response(response, call_num: int):
+    if _display_mode != 'json':
+        return
     print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*80}")
     print(f"📥 第 {call_num} 次 API 调用 - API的完整响应")
     print(f"{'='*80}{Colors.ENDC}\n")
@@ -443,7 +452,7 @@ def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
 
     call_count += 1
     print_context(conversation_history, all_tools, call_count, model)
-    response = safe_api_call()
+    response = show_loading_with_task(safe_api_call, msg="Agent 思考中")
     if response is None:
         return ""
     print_response(response, call_count)
@@ -454,11 +463,17 @@ def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
-                print(f"\n{Colors.BOLD}{Colors.CYAN}🔧 执行工具: {block.name}{Colors.ENDC}")
-                print(f"{Colors.CYAN}   工作目录: {_cwd}{Colors.ENDC}")
+                if _display_mode == 'json':
+                    print(f"\n{Colors.BOLD}{Colors.CYAN}🔧 执行工具: {block.name}{Colors.ENDC}")
+                    print(f"{Colors.CYAN}   工作目录: {_cwd}{Colors.ENDC}")
+                else:
+                    print(f"  {Colors.CYAN}◆ {block.name}...{Colors.ENDC}", end='', flush=True)
                 tool_result = process_tool_call(block.name, block.input)
                 tool_result = truncate_tool_result(tool_result)
-                print(f"{Colors.GREEN}✓ 工具执行结果:{Colors.ENDC}\n{tool_result}\n")
+                if _display_mode == 'json':
+                    print(f"{Colors.GREEN}✓ 工具执行结果:{Colors.ENDC}\n{tool_result}\n")
+                else:
+                    print(f"\r  {Colors.GREEN}✓ {block.name}{Colors.ENDC}          ")
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -470,7 +485,7 @@ def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
 
         call_count += 1
         print_context(conversation_history, all_tools, call_count, model)
-        response = safe_api_call()
+        response = show_loading_with_task(safe_api_call, msg="Agent 思考中")
         if response is None:
             return ""
         print_response(response, call_count)
@@ -484,6 +499,39 @@ def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
 # 主程序
 # ============================================================================
 
+def show_loading_with_task(task_func, msg: str = "正在预加载"):
+    """显示加载动画，同时执行实际任务"""
+    frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+    idx = 0
+
+    # 在后台线程执行任务
+    result = [None]
+    exception = [None]
+
+    def run_task():
+        try:
+            result[0] = task_func()
+        except Exception as e:
+            exception[0] = e
+
+    task_thread = threading.Thread(target=run_task, daemon=True)
+    task_thread.start()
+
+    # 显示加载动画直到任务完成
+    while task_thread.is_alive():
+        print(f"\r  {Colors.CYAN}{frames[idx % len(frames)]} {msg}...{Colors.ENDC}", end='', flush=True)
+        idx += 1
+        task_thread.join(timeout=0.1)
+
+    if exception[0]:
+        print(f"\r  {Colors.RED}✗ {msg}失败{Colors.ENDC}          ")
+        raise exception[0]
+    else:
+        print(f"\r  {Colors.GREEN}✓ {msg}完成{Colors.ENDC}          ")
+
+    return result[0]
+
+
 def print_environment_info():
     user = os.environ.get("USERNAME", os.environ.get("USER", "unknown"))
     print(f"\n{Colors.BOLD}{Colors.CYAN}📍 运行环境信息:{Colors.ENDC}")
@@ -495,16 +543,37 @@ def print_environment_info():
 
 
 def main():
-    print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}")
-    print("🤖 Agent 真实工作流学习工具 -HuaXiaowei")
-    print("")
-    print("每次API调用都会打印完整的JSON请求和响应")
-    print(f"{'='*80}{Colors.ENDC}")
+    global _display_mode
+
+    # 打印启动界面
+    print(f"\n{Colors.BOLD}{Colors.HEADER}╭─────────────────────────────────────────────────────────────────────────────╮{Colors.ENDC}")
+    print(f"{Colors.BOLD}{Colors.HEADER}│  🤖  Agent  ·  AI 学习工具                                    HuaXiaowei   │{Colors.ENDC}")
+    print(f"{Colors.BOLD}{Colors.HEADER}╰─────────────────────────────────────────────────────────────────────────────╯{Colors.ENDC}\n")
+
+    # 模式选择
+    print(f"{Colors.BOLD}{Colors.CYAN}请选择运行模式：{Colors.ENDC}\n")
+    print(f"  {Colors.GREEN}[1]{Colors.ENDC}  对话模式    像正常 AI 助手一样交互，隐藏 API 细节")
+    print(f"  {Colors.GREEN}[2]{Colors.ENDC}  JSON 模式   显示完整 API 请求/响应 JSON，适合学习调试\n")
+
+    while True:
+        choice = input(f"  {Colors.BOLD}{Colors.YELLOW}输入 1 或 2，按 Enter 确认：{Colors.ENDC} ").strip()
+        if choice == "1":
+            _display_mode = 'chat'
+            print(f"  {Colors.GREEN}✓ 已选择：对话模式{Colors.ENDC}")
+            break
+        elif choice == "2":
+            _display_mode = 'json'
+            print(f"  {Colors.GREEN}✓ 已选择：JSON 模式{Colors.ENDC}")
+            break
+        else:
+            print(f"  {Colors.RED}✗ 输入无效，请输入 1 或 2{Colors.ENDC}")
+
     print_environment_info()
 
-    # 连接 MCP 服务器
+    # 连接 MCP 服务器（带加载动画）
     print(f"{Colors.BOLD}{Colors.CYAN}🔌 连接 MCP 服务器...{Colors.ENDC}")
-    mcp_manager.init_servers()
+    show_loading_with_task(mcp_manager.init_servers)
+    print()
 
     print("\n功能说明：")
     print("  • 支持多轮对话，维护完整对话历史")
@@ -528,7 +597,7 @@ def main():
         if not user_input:
             continue
 
-        print(f"\n{Colors.BOLD}{Colors.YELLOW}Agent 处理中...{Colors.ENDC}")
+        print()
         try:
             response = chat(user_input)
         except Exception as e:
