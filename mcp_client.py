@@ -55,6 +55,9 @@ _mcp_loop = asyncio.new_event_loop()
 _mcp_thread = threading.Thread(target=_mcp_loop.run_forever, daemon=True)
 _mcp_thread.start()
 
+# 跨线程 print 锁，供 agent.py 导入使用
+print_lock = threading.Lock()
+
 
 def _run_async(coro):
     """在后台事件循环中执行异步协程，同步等待结果"""
@@ -119,11 +122,15 @@ class MCPManager:
             name = config["name"]
             try:
                 tools = await self._connect_server(config)
-                print(f"  \033[92m[OK] {name}: 已连接，发现 {len(tools)} 个工具\033[0m")
-                for t in tools:
-                    print(f"    - mcp_{name}__{t.name}")
+                with print_lock:
+                    print(f"\r" + " " * 60 + "\r", end='')
+                    print(f"  \033[92m[OK] {name}: 已连接，发现 {len(tools)} 个工具\033[0m")
+                    for t in tools:
+                        print(f"    - mcp_{name}__{t.name}")
             except Exception as e:
-                print(f"  \033[91m[FAIL] {name}: 连接失败 - {e}\033[0m")
+                with print_lock:
+                    print(f"\r" + " " * 60 + "\r", end='')
+                    print(f"  \033[91m[FAIL] {name}: 连接失败 - {e}\033[0m")
 
     async def _call_tool(self, prefixed_name: str, arguments: dict) -> str:
         """调用 MCP 工具"""

@@ -9,14 +9,13 @@ Agent 学习工具 - 可视化展示Agent工作原理
 
 import sys
 import os
-import io
 
 # 必须最先执行：切换 CMD 代码页到 UTF-8，确保双击 exe 也生效
 os.system("chcp 65001 >nul 2>&1")
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='replace')
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+sys.stdin.reconfigure(encoding='utf-8', errors='replace')
 
 import anthropic
 import subprocess
@@ -29,7 +28,7 @@ import requests
 import chardet
 import time
 import threading
-from mcp_client import mcp_manager
+from mcp_client import mcp_manager, print_lock as _print_lock
 
 class Colors:
     HEADER = '\033[95m'
@@ -480,29 +479,35 @@ def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
 
     def safe_api_call():
         global conversation_history
-        try:
-            return client.messages.create(
-                model=model,
-                max_tokens=2048,
-                system=build_system_prompt(),
-                tools=all_tools,
-                messages=conversation_history
-            )
-        except anthropic.BadRequestError:
-            print(f"\n{Colors.RED}[上下文溢出] API 返回 400，强制裁剪历史重试...{Colors.ENDC}")
-            conversation_history = trim_history(
-                conversation_history, build_system_prompt(), token_budget=80000
-            )
-            return client.messages.create(
-                model=model,
-                max_tokens=2048,
-                system=build_system_prompt(),
-                tools=all_tools,
-                messages=conversation_history
-            )
-        except anthropic.PermissionDeniedError:
-            print(f"\n{Colors.RED}{Colors.BOLD}API欠费失效，请联系xiaoweihuacqu@gamil.com{Colors.ENDC}\n")
-            return None
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            try:
+                return client.messages.create(
+                    model=model,
+                    max_tokens=2048,
+                    system=build_system_prompt(),
+                    tools=all_tools,
+                    messages=conversation_history
+                )
+            except anthropic.RateLimitError:
+                if attempt < max_retries:
+                    time.sleep(2 ** (attempt + 1))  # 2s, 4s, 8s
+                    continue
+                raise
+            except anthropic.BadRequestError:
+                conversation_history = trim_history(
+                    conversation_history, build_system_prompt(), token_budget=80000
+                )
+                return client.messages.create(
+                    model=model,
+                    max_tokens=2048,
+                    system=build_system_prompt(),
+                    tools=all_tools,
+                    messages=conversation_history
+                )
+            except anthropic.PermissionDeniedError:
+                print(f"\n{Colors.RED}{Colors.BOLD}API欠费失效，请联系xiaoweihuacqu@gamil.com{Colors.ENDC}\n")
+                return None
 
     call_count += 1
     print_context(conversation_history, all_tools, call_count, model)
@@ -574,15 +579,18 @@ def show_loading_with_task(task_func, msg: str = "正在预加载"):
 
     # 显示加载动画直到任务完成
     while task_thread.is_alive():
-        print(f"\r  {Colors.CYAN}{frames[idx % len(frames)]} {msg}...{Colors.ENDC}", end='', flush=True)
+        with _print_lock:
+            print(f"\r  {Colors.CYAN}{frames[idx % len(frames)]} {msg}...{Colors.ENDC}", end='', flush=True)
         idx += 1
         task_thread.join(timeout=0.1)
 
+    # 清除动画行，输出最终状态
+    print("\r" + " " * 60 + "\r", end='', flush=True)
     if exception[0]:
-        print(f"\r  {Colors.RED}✗ {msg}失败{Colors.ENDC}          ")
+        print(f"  {Colors.RED}✗ {msg}失败{Colors.ENDC}")
         raise exception[0]
     else:
-        print(f"\r  {Colors.GREEN}✓ {msg}完成{Colors.ENDC}          ")
+        print(f"  {Colors.GREEN}✓ {msg}完成{Colors.ENDC}")
 
     return result[0]
 
@@ -602,7 +610,7 @@ def main():
 
     # 打印启动界面
     print(f"\n{Colors.BOLD}{Colors.HEADER}╭─────────────────────────────────────────────────────────────────────────────╮{Colors.ENDC}")
-    print(f"{Colors.BOLD}{Colors.HEADER}│  🤖  Agent  ·  AI 学习工具                                    HuaXiaowei    │{Colors.ENDC}")
+    print(f"{Colors.BOLD}{Colors.HEADER}│  🤖  Agent  ·  LLM API工作流演示工具                          HuaXiaowei    │{Colors.ENDC}")
     print(f"{Colors.BOLD}{Colors.HEADER}╰─────────────────────────────────────────────────────────────────────────────╯{Colors.ENDC}\n")
 
     # 模式选择
@@ -655,6 +663,9 @@ def main():
         print()
         try:
             response = chat(user_input)
+        except anthropic.RateLimitError:
+            print(f"\n{Colors.YELLOW}请求过于频繁，请稍后再试。{Colors.ENDC}")
+            continue
         except Exception as e:
             print(f"\n{Colors.RED}发生错误: {e}{Colors.ENDC}")
             print(f"{Colors.YELLOW}已清空对话历史，请重新开始。{Colors.ENDC}")
