@@ -44,9 +44,15 @@ client = anthropic.Anthropic(
     api_key="sk-udhHZddO7Y79ZQEPhd3JJnIt6idrmn5FYoSVQIv8ZAYiJpNe",
     base_url="https://codeflow.asia"
 )
+    # api_key="sk-sp-f8a97e8602d343f68eef487e13ef5c24",
+    # base_url="https://coding.dashscope.aliyuncs.com/apps/anthropic"
+
+    # api_key="sk-udhHZddO7Y79ZQEPhd3JJnIt6idrmn5FYoSVQIv8ZAYiJpNe",
+    # base_url="https://codeflow.asia"
 
 conversation_history = []
 call_count = 0
+token_stats = {"total_input": 0, "total_output": 0}
 
 # 当前工作目录，跨命令持久化，支持 cd 切换
 _cwd = os.getcwd()
@@ -91,19 +97,59 @@ def print_context(messages: list, tools: list, call_num: int, model: str):
         {"role": m["role"], "content": serialize_content(m["content"])}
         for m in messages
     ]
-    api_request = {"model": model, "max_tokens": 2048, "system": build_system_prompt(), "tools": tools, "messages": serializable_messages}
+    api_request = {
+        "model": model,
+        "max_tokens": 2048,
+        "system": build_system_prompt(),
+        "tools": tools,
+        "messages": serializable_messages,
+        "temperature": "未设置（默认1.0）",
+        "top_p": "未设置",
+        "top_k": "未设置",
+        "stop_sequences": "未设置",
+    }
     print(f"{Colors.CYAN}{Colors.BOLD}【完整JSON请求】{Colors.ENDC}\n")
     print(json.dumps(api_request, ensure_ascii=False, indent=2))
     print()
 
 
 def print_response(response, call_num: int):
+    global token_stats
     if _display_mode != 'json':
+        # 非 json 模式也累计 token
+        if hasattr(response, 'usage'):
+            token_stats["total_input"] += response.usage.input_tokens
+            token_stats["total_output"] += response.usage.output_tokens
         return
     print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*80}")
     print(f"📥 第 {call_num} 次 API 调用 - API的完整响应")
     print(f"{'='*80}{Colors.ENDC}\n")
-    response_data = {"stop_reason": response.stop_reason, "content": []}
+
+    # 构建 usage 信息
+    usage_data = {}
+    if hasattr(response, 'usage'):
+        usage_data["input_tokens"] = response.usage.input_tokens
+        usage_data["output_tokens"] = response.usage.output_tokens
+        cache_create = getattr(response.usage, 'cache_creation_input_tokens', None)
+        cache_read = getattr(response.usage, 'cache_read_input_tokens', None)
+        if cache_create is not None:
+            usage_data["cache_creation_input_tokens"] = cache_create
+        if cache_read is not None:
+            usage_data["cache_read_input_tokens"] = cache_read
+        token_stats["total_input"] += response.usage.input_tokens
+        token_stats["total_output"] += response.usage.output_tokens
+
+    # 构建完整响应数据
+    response_data = {
+        "id": getattr(response, 'id', None),
+        "type": getattr(response, 'type', None),
+        "role": getattr(response, 'role', None),
+        "model": getattr(response, 'model', None),
+        "stop_reason": response.stop_reason,
+        "stop_sequence": getattr(response, 'stop_sequence', None),
+        "usage": usage_data,
+        "content": []
+    }
     for block in response.content:
         if block.type == "text":
             response_data["content"].append({"type": "text", "text": block.text})
@@ -111,6 +157,14 @@ def print_response(response, call_num: int):
             response_data["content"].append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
     print(f"{Colors.YELLOW}{Colors.BOLD}【完整JSON响应】{Colors.ENDC}\n")
     print(json.dumps(response_data, ensure_ascii=False, indent=2))
+
+    # 打印 token 累计统计
+    print(f"\n{Colors.BOLD}{Colors.CYAN}【Token 统计】{Colors.ENDC}")
+    if usage_data:
+        print(f"  本次输入: {usage_data.get('input_tokens', 0)} tokens")
+        print(f"  本次输出: {usage_data.get('output_tokens', 0)} tokens")
+    print(f"  累计输入: {token_stats['total_input']} tokens")
+    print(f"  累计输出: {token_stats['total_output']} tokens")
     print()
 
 
@@ -477,7 +531,8 @@ def chat(user_message: str, model: str = "claude-haiku-4-5-20251001") -> str:
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": tool_result
+                    "content": tool_result,
+                    "is_error": False
                 })
 
         conversation_history.append({"role": "user", "content": tool_results})

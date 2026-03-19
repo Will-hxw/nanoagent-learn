@@ -7,8 +7,19 @@ MCP 客户端模块 - 管理远程 MCP 服务器连接和工具调用
 
 import asyncio
 import threading
+import json
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+
+
+# ============================================================================
+# 颜色常量（用于 JSON 模式打印）
+# ============================================================================
+
+_BOLD   = '\033[1m'
+_CYAN   = '\033[96m'
+_YELLOW = '\033[93m'
+_ENDC   = '\033[0m'
 
 
 # ============================================================================
@@ -116,11 +127,50 @@ class MCPManager:
 
     async def _call_tool(self, prefixed_name: str, arguments: dict) -> str:
         """调用 MCP 工具"""
+        import agent as _agent
+
         server_name = self.tool_routing[prefixed_name]
         original_name = prefixed_name[len(f"mcp_{server_name}__"):]
         session = self.servers[server_name]["session"]
 
+        # 打印请求
+        if _agent._display_mode == 'json':
+            print(f"\n{_CYAN}{_BOLD}{'='*80}")
+            print(f"🔌 MCP 工具调用 - 发送请求")
+            print(f"{'='*80}{_ENDC}\n")
+            mcp_request = {
+                "server": server_name,
+                "tool": original_name,
+                "prefixed_name": prefixed_name,
+                "arguments": arguments
+            }
+            print(f"{_CYAN}{_BOLD}【MCP请求】{_ENDC}\n")
+            print(json.dumps(mcp_request, ensure_ascii=False, indent=2))
+            print()
+
         result = await session.call_tool(original_name, arguments)
+
+        # 打印响应
+        if _agent._display_mode == 'json':
+            print(f"\n{_YELLOW}{_BOLD}{'='*80}")
+            print(f"🔌 MCP 工具调用 - 收到响应")
+            print(f"{'='*80}{_ENDC}\n")
+            content_list = []
+            for block in result.content:
+                if hasattr(block, "text"):
+                    content_list.append({"type": "text", "text": block.text})
+                else:
+                    content_list.append({"type": str(type(block).__name__), "raw": str(block)})
+            mcp_response = {
+                "server": server_name,
+                "tool": original_name,
+                "is_error": getattr(result, "isError", False),
+                "content": content_list
+            }
+            print(f"{_YELLOW}{_BOLD}【MCP响应】{_ENDC}\n")
+            print(json.dumps(mcp_response, ensure_ascii=False, indent=2))
+            print()
+
         texts = []
         for block in result.content:
             if hasattr(block, "text"):
