@@ -274,9 +274,12 @@ def execute_bash(command: str) -> str:
         def decode_bytes(b):
             if not b:
                 return ""
-            detected = chardet.detect(b)
-            enc = detected.get("encoding") or _encoding
-            return b.decode(enc, errors='replace')
+            try:
+                return b.decode('utf-8')
+            except UnicodeDecodeError:
+                detected = chardet.detect(b)
+                enc = detected.get("encoding") or 'gbk'
+                return b.decode(enc, errors='replace')
         output = decode_bytes(result.stdout) + decode_bytes(result.stderr)
         return output.strip() or "命令执行成功，无输出"
 
@@ -308,9 +311,13 @@ def execute_read_file(path: str) -> str:
             raw = f.read()
         if not raw:
             return "（空文件）"
-        detected = chardet.detect(raw)
-        enc = detected.get("encoding") or 'utf-8'
-        return raw.decode(enc, errors='replace')
+        # 优先尝试 UTF-8，失败再用 chardet 检测
+        try:
+            return raw.decode('utf-8')
+        except UnicodeDecodeError:
+            detected = chardet.detect(raw)
+            enc = detected.get("encoding") or 'gbk'
+            return raw.decode(enc, errors='replace')
     except Exception as e:
         return f"读取错误: {str(e)}"
 
