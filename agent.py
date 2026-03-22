@@ -156,12 +156,8 @@ def print_context(messages: list, tools: list, call_num: int, model: str):
 
 
 def print_response(response, call_num: int):
-    global token_stats
+    """打印完整 JSON 响应（仅 json 模式），不累加 token（调用方负责累加）"""
     if _display_mode != 'json':
-        # 非 json 模式也累计 token
-        if hasattr(response, 'usage'):
-            token_stats["total_input"] += response.usage.input_tokens
-            token_stats["total_output"] += response.usage.output_tokens
         return
     print(f"\n{Colors.HEADER}{Colors.BOLD}{'='*80}")
     print(f"📥 第 {call_num} 次 API 调用 - API的完整响应")
@@ -178,8 +174,6 @@ def print_response(response, call_num: int):
             usage_data["cache_creation_input_tokens"] = cache_create
         if cache_read is not None:
             usage_data["cache_read_input_tokens"] = cache_read
-        token_stats["total_input"] += response.usage.input_tokens
-        token_stats["total_output"] += response.usage.output_tokens
 
     # 构建完整响应数据
     response_data = {
@@ -878,6 +872,14 @@ def _print_token_stats_streaming(message):
     print()
 
 
+def _print_token_stats_chat(message):
+    """chat 模式：简洁显示 token 消耗"""
+    if not hasattr(message, 'usage'):
+        return
+    usage = message.usage
+    print(f"  {Colors.YELLOW}[tokens] 本次: ↑{usage.input_tokens} ↓{usage.output_tokens} | 累计: ↑{token_stats['total_input']} ↓{token_stats['total_output']}{Colors.ENDC}")
+
+
 def stream_chat_response(model, all_tools, system_prompt, messages):
     """流式调用 API，chat模式等首token后收集完整响应再渲染，json模式实时打印event。"""
     global _streaming_available
@@ -909,28 +911,25 @@ def stream_chat_response(model, all_tools, system_prompt, messages):
                     stream.close()
                     return None
 
-                if _display_mode == 'json':
-                    _print_stream_event_json(event)
-                else:
-                    # chat 模式：检测首个 text delta 到达
-                    if not first_token_received:
-                        is_text = (event.type == "content_block_delta"
-                                   and hasattr(event.delta, 'text'))
-                        is_tool = (event.type == "content_block_start"
-                                   and event.content_block.type == "tool_use")
-                        if is_text or is_tool:
-                            first_token_received = True
-                            print("\r" + " " * 60 + "\r", end='', flush=True)
-                            if is_text:
-                                print(f"  {Colors.GREEN}✓ Agent 思考完成{Colors.ENDC}")
-                        else:
-                            # 更新转圈动画
-                            now = time.time()
-                            if now - last_frame_time[0] >= 0.1:
-                                frame_idx[0] = (frame_idx[0] + 1) % len(frames)
-                                last_frame_time[0] = now
-                                print(f"\r  {Colors.CYAN}{frames[frame_idx[0]]} Agent 思考中...{Colors.ENDC}", end='', flush=True)
-                    _print_stream_event_chat(event)
+                # 两种模式统一用 chat 事件处理（只跟踪工具名）
+                if not first_token_received and _display_mode != 'json':
+                    is_text = (event.type == "content_block_delta"
+                               and hasattr(event.delta, 'text'))
+                    is_tool = (event.type == "content_block_start"
+                               and event.content_block.type == "tool_use")
+                    if is_text or is_tool:
+                        first_token_received = True
+                        print("\r" + " " * 60 + "\r", end='', flush=True)
+                        if is_text:
+                            print(f"  {Colors.GREEN}✓ Agent 思考完成{Colors.ENDC}")
+                    else:
+                        # 更新转圈动画
+                        now = time.time()
+                        if now - last_frame_time[0] >= 0.1:
+                            frame_idx[0] = (frame_idx[0] + 1) % len(frames)
+                            last_frame_time[0] = now
+                            print(f"\r  {Colors.CYAN}{frames[frame_idx[0]]} Agent 思考中...{Colors.ENDC}", end='', flush=True)
+                _print_stream_event_chat(event)
 
             if not first_token_received and _display_mode != 'json':
                 print("\r" + " " * 60 + "\r", end='', flush=True)
@@ -941,7 +940,9 @@ def stream_chat_response(model, all_tools, system_prompt, messages):
                 token_stats["total_input"] += final_message.usage.input_tokens
                 token_stats["total_output"] += final_message.usage.output_tokens
             if _display_mode == 'json':
-                _print_token_stats_streaming(final_message)
+                print_response(final_message, call_count)
+            else:
+                _print_token_stats_chat(final_message)
             return final_message
 
     except Exception as e:
@@ -967,8 +968,11 @@ def _fallback_non_stream(model, all_tools, system_prompt, messages):
     if response and hasattr(response, 'usage'):
         token_stats["total_input"] += response.usage.input_tokens
         token_stats["total_output"] += response.usage.output_tokens
-    if _display_mode == 'json' and response:
-        print_response(response, call_count)
+    if response:
+        if _display_mode == 'json':
+            print_response(response, call_count)
+        else:
+            _print_token_stats_chat(response)
     return response
 
 
@@ -1277,7 +1281,8 @@ def main():
             print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*80}")
             print("🎯 最终回复")
             print(f"{'='*80}{Colors.ENDC}")
-            print(f"{Colors.GREEN}{response}{Colors.ENDC}\n")
+            render_markdown(response)
+            print()
 
 if __name__ == "__main__":
     main()
