@@ -36,6 +36,7 @@ from rich.markdown import Markdown as RichMarkdown
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from mcp_client import mcp_manager, print_lock as _print_lock
+import config
 
 class Colors:
     HEADER = '\033[95m'
@@ -47,12 +48,9 @@ class Colors:
     BOLD   = '\033[1m'
 
 client = anthropic.Anthropic(
-    api_key="sk-cp-N0a9hAUNXsnOun0mxby9_R9ESe_V6hDhZJ5VNuOEpVV_rqFTMXmnsElpXDX6IV_DuBwI6U4_k0ce6P4Wn3DTEVwiRjaIhJF2OfX688MXScwY3eypkXx2sXY",
-    base_url="https://api.minimaxi.com/anthropic"
+    api_key=config.get("api.key"),
+    base_url=config.get("api.base_url"),
 )
-
-    # api_key="sk-udhHZddO7Y79ZQEPhd3JJnIt6idrmn5FYoSVQIv8ZAYiJpNe",
-    # base_url="https://codeflow.asia"
 
 conversation_history = []
 call_count = 0
@@ -73,7 +71,7 @@ _CWD_SENTINEL = "===CWD_SYNC==="
 _encoding = locale.getpreferredencoding(False) or 'utf-8'
 
 # 运行模式：'json' 或 'chat'
-_display_mode = 'chat'
+_display_mode = config.get("display.mode", "chat")
 
 # 终端渲染和输入
 _rich_console = Console()
@@ -142,7 +140,7 @@ def print_context(messages: list, tools: list, call_num: int, model: str):
     ]
     api_request = {
         "model": model,
-        "max_tokens": 2048,
+        "max_tokens": config.get("api.max_tokens", 2048),
         "system": build_system_prompt(),
         "tools": tools,
         "messages": serializable_messages,
@@ -340,6 +338,9 @@ tools = [
     }
 ]
 
+# 按配置过滤已禁用的工具
+tools = [t for t in tools if config.is_tool_enabled(t["name"])]
+
 
 # ============================================================================
 # 工具执行
@@ -368,7 +369,7 @@ def execute_bash(command: str) -> str:
             shell=True,
             capture_output=True,
             cwd=_cwd,
-            timeout=30,
+            timeout=config.get_tool_config("bash").get("timeout", 30),
         )
 
         stdout_text = _decode_bytes(result.stdout)
@@ -520,14 +521,15 @@ def execute_grep_search(pattern: str, path: str = ".", file_pattern: str = None)
             return f"正则表达式错误: {e}"
 
         matches = []
-        max_matches = 100
+        _grep_cfg = config.get_tool_config("grep_search")
+        max_matches = _grep_cfg.get("max_matches", 100)
 
         def search_file(filepath):
             if os.path.splitext(filepath)[1].lower() in _BINARY_EXT:
                 return
             try:
                 with open(filepath, 'rb') as f:
-                    raw = f.read(256 * 1024)
+                    raw = f.read(_grep_cfg.get("max_file_size", 262144))
                 try:
                     text = raw.decode('utf-8')
                 except UnicodeDecodeError:
@@ -573,7 +575,7 @@ def execute_web_fetch(url: str) -> str:
     try:
         jina_url = f"https://r.jina.ai/{url}"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        resp = requests.get(jina_url, headers=headers, timeout=30)
+        resp = requests.get(jina_url, headers=headers, timeout=config.get_tool_config("web_fetch").get("timeout", 30))
         resp.raise_for_status()
         return resp.text
     except Exception as e:
@@ -582,15 +584,16 @@ def execute_web_fetch(url: str) -> str:
 
 def execute_web_search(query: str, num_results: int = 15) -> str:
     try:
+        _ws_cfg = config.get_tool_config("web_search")
         resp = requests.post(
             "https://api.tavily.com/search",
             json={
-                "api_key": "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",
+                "api_key": _ws_cfg.get("api_key", ""),
                 "query": query,
                 "search_depth": "advanced",
                 "max_results": num_results
             },
-            timeout=30
+            timeout=_ws_cfg.get("timeout", 30)
         )
         resp.raise_for_status()
         data = resp.json()
@@ -631,8 +634,10 @@ def process_tool_call(tool_name: str, tool_input: dict) -> str:
 # 上下文管理
 # ============================================================================
 
-def truncate_tool_result(result: str, max_chars: int = 30000) -> str:
+def truncate_tool_result(result: str, max_chars: int = None) -> str:
     """截断过长的工具返回结果，保留头尾各一半"""
+    if max_chars is None:
+        max_chars = config.get("context.max_tool_result_chars", 30000)
     if len(result) <= max_chars:
         return result
     half = max_chars // 2
@@ -659,8 +664,10 @@ def estimate_tokens(messages: list, system_prompt: str = "") -> int:
     return total_chars // 3
 
 
-def trim_history(messages: list, system_prompt: str, token_budget: int = 150000) -> list:
+def trim_history(messages: list, system_prompt: str, token_budget: int = None) -> list:
     """超预算时裁剪早期历史，保留最近对话"""
+    if token_budget is None:
+        token_budget = config.get("context.token_budget", 150000)
     current = estimate_tokens(messages, system_prompt)
     if current <= token_budget:
         return messages
@@ -726,7 +733,7 @@ def build_system_prompt() -> str:
         "5. cd 命令会持久改变工作目录，后续命令在新目录执行\n"
         "6. 编辑文件时，优先使用 edit_file 进行精确修改，避免用 write_file 整文件重写\n"
         "7. 查看目录结构用 list_dir，搜索代码内容用 grep_search，比 bash 更稳定\n"
-        "\n回复格式规则：\n"
+        "\n回复格式规则（终端可渲染Markdown）：\n"
         "- 使用 Markdown 格式回复（标题、列表、粗体、代码块等），终端会正确渲染\n"
         "- 代码块请标注语言（如 ```python），以便语法高亮\n"
     )
@@ -795,7 +802,7 @@ def stream_chat_response(model, all_tools, system_prompt, messages):
     try:
         with client.messages.stream(
             model=model,
-            max_tokens=2048,
+            max_tokens=config.get("api.max_tokens", 2048),
             system=system_prompt,
             tools=all_tools,
             messages=messages,
@@ -865,7 +872,7 @@ def _fallback_non_stream(model, all_tools, system_prompt, messages):
     def api_call():
         return client.messages.create(
             model=model,
-            max_tokens=2048,
+            max_tokens=config.get("api.max_tokens", 2048),
             system=system_prompt,
             tools=all_tools,
             messages=messages,
@@ -882,7 +889,7 @@ def _fallback_non_stream(model, all_tools, system_prompt, messages):
 def _call_with_retry(model, all_tools, messages):
     """带重试的 API 调用，优先流式，失败降级"""
     system_prompt = build_system_prompt()
-    max_retries = 3
+    max_retries = config.get("api.max_retries", 3)
     for attempt in range(max_retries + 1):
         try:
             return stream_chat_response(model, all_tools, system_prompt, messages)
@@ -894,15 +901,17 @@ def _call_with_retry(model, all_tools, messages):
                 continue
             raise
         except anthropic.BadRequestError:
-            messages[:] = trim_history(messages, system_prompt, token_budget=80000)
+            messages[:] = trim_history(messages, system_prompt, token_budget=config.get("context.fallback_token_budget", 80000))
             return stream_chat_response(model, all_tools, system_prompt, messages)
         except anthropic.PermissionDeniedError:
             print(f"\n{Colors.RED}{Colors.BOLD}API欠费失效，请联系xiaoweihuacqu@gamil.com{Colors.ENDC}\n")
             return None
 
 
-def chat(user_message: str, model: str = "MiniMax-M2.7") -> str:
+def chat(user_message: str, model: str = None) -> str:
     global call_count, conversation_history
+    if model is None:
+        model = config.get("api.model", "MiniMax-M2.7")
     all_tools = tools + mcp_manager.get_tool_definitions()
 
     conversation_history.append({"role": "user", "content": user_message})

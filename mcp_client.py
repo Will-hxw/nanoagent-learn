@@ -8,6 +8,7 @@ MCP 客户端模块 - 管理远程 MCP 服务器连接和工具调用
 import asyncio
 import threading
 import json
+import config
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.stdio import stdio_client
@@ -21,41 +22,6 @@ _BOLD   = '\033[1m'
 _CYAN   = '\033[96m'
 _YELLOW = '\033[93m'
 _ENDC   = '\033[0m'
-
-
-# ============================================================================
-# MCP 服务器配置
-# ============================================================================
-
-MCP_SERVERS = [
-    {
-        "name": "context7",
-        "url": "https://mcp.context7.com/mcp",
-        "headers": {
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-            "CONTEXT7_API_KEY": "ctx7sk-50b9e9fa-299a-4792-9035-46d55f213384",
-        },
-    },
-    {
-        "name": "deepwiki",
-        "url": "https://mcp.deepwiki.com/mcp",
-        "headers": {
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        },
-    },
-    {
-        "name": "minimax",
-        "type": "stdio",
-        "command": "uvx",
-        "args": ["minimax-coding-plan-mcp", "-y"],
-        "env": {
-            "MINIMAX_API_KEY": "sk-cp-N0a9hAUNXsnOun0mxby9_R9ESe_V6hDhZJ5VNuOEpVV_rqFTMXmnsElpXDX6IV_DuBwI6U4_k0ce6P4Wn3DTEVwiRjaIhJF2OfX688MXScwY3eypkXx2sXY",
-            "MINIMAX_API_HOST": "https://api.minimaxi.com",
-        },
-    },
-]
 
 
 # ============================================================================
@@ -73,7 +39,7 @@ print_lock = threading.Lock()
 def _run_async(coro):
     """在后台事件循环中执行异步协程，同步等待结果"""
     future = asyncio.run_coroutine_threadsafe(coro, _mcp_loop)
-    return future.result(timeout=30)
+    return future.result(timeout=config.get("mcp_timeout", 30))
 
 
 # ============================================================================
@@ -93,21 +59,21 @@ class MCPManager:
 
     # ---- async 内部方法 ----
 
-    async def _connect_server(self, config: dict):
+    async def _connect_server(self, srv_cfg: dict):
         """连接单个 MCP 服务器，发现工具"""
-        name = config["name"]
+        name = srv_cfg["name"]
 
-        if config.get("type") == "stdio":
+        if srv_cfg.get("type") == "stdio":
             params = StdioServerParameters(
-                command=config["command"],
-                args=config.get("args", []),
-                env=config.get("env"),
+                command=srv_cfg["command"],
+                args=srv_cfg.get("args", []),
+                env=srv_cfg.get("env"),
             )
             transport_ctx = stdio_client(params)
             read_stream, write_stream = await transport_ctx.__aenter__()
         else:
-            url = config["url"]
-            headers = config["headers"]
+            url = srv_cfg["url"]
+            headers = srv_cfg["headers"]
             transport_ctx = streamablehttp_client(url=url, headers=headers)
             read_stream, write_stream, _ = await transport_ctx.__aenter__()
         self._contexts.append(transport_ctx)
@@ -138,10 +104,10 @@ class MCPManager:
 
     async def _connect_all(self, configs: list):
         """连接所有 MCP 服务器"""
-        for config in configs:
-            name = config["name"]
+        for srv_cfg in configs:
+            name = srv_cfg["name"]
             try:
-                tools = await self._connect_server(config)
+                tools = await self._connect_server(srv_cfg)
                 with print_lock:
                     print(f"\r" + " " * 60 + "\r", end='')
                     print(f"  \033[92m[OK] {name}: 已连接，发现 {len(tools)} 个工具\033[0m")
@@ -210,7 +176,7 @@ class MCPManager:
 
     def init_servers(self):
         """启动时调用：连接所有 MCP 服务器"""
-        _run_async(self._connect_all(MCP_SERVERS))
+        _run_async(self._connect_all(config.get_mcp_servers()))
 
     def get_tool_definitions(self) -> list:
         """返回 Anthropic 格式的 MCP 工具定义列表"""

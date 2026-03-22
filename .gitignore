@@ -47,5 +47,7 @@ logs/
 .cache/
 
 # 配置文件（包含密钥）
+config.yaml
+config.local.py
 
 function.md

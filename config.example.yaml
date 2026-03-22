@@ -1,0 +1,81 @@
+# ============================================================
+# Agent 配置文件模板
+# 复制此文件为 config.yaml，填入你自己的 API key
+# ============================================================
+
+# --- API 配置 ---
+api:
+  key: "your-api-key-here"
+  base_url: "https://api.minimaxi.com/anthropic"
+  model: "MiniMax-M2.7"
+  max_tokens: 2048
+  max_retries: 3
+
+# --- 显示与交互 ---
+# mode: chat（隐藏API细节）或 json（显示完整请求/响应）
+display:
+  mode: "chat"
+
+# --- 上下文管理 ---
+context:
+  token_budget: 150000
+  fallback_token_budget: 80000
+  max_tool_result_chars: 30000
+
+# --- 工具配置 ---
+# enabled: false 可禁用某个工具
+tools:
+  bash:
+    enabled: true
+    timeout: 30
+  write_file:
+    enabled: true
+  read_file:
+    enabled: true
+  edit_file:
+    enabled: true
+  list_dir:
+    enabled: true
+  grep_search:
+    enabled: true
+    max_matches: 100
+    max_file_size: 262144    # 256KB
+  web_fetch:
+    enabled: true
+    timeout: 30
+  web_search:
+    enabled: true
+    timeout: 30
+    api_key: "your-tavily-api-key-here"
+
+# --- MCP 服务器 ---
+# enabled: false 可禁用某个服务器
+mcp_servers:
+  - name: context7
+    enabled: true
+    type: http
+    url: "https://mcp.context7.com/mcp"
+    headers:
+      Accept: "application/json, text/event-stream"
+      Content-Type: "application/json"
+      CONTEXT7_API_KEY: "your-context7-api-key-here"
+
+  - name: deepwiki
+    enabled: true
+    type: http
+    url: "https://mcp.deepwiki.com/mcp"
+    headers:
+      Accept: "application/json, text/event-stream"
+      Content-Type: "application/json"
+
+  - name: minimax
+    enabled: true
+    type: stdio
+    command: "uvx"
+    args: ["minimax-coding-plan-mcp", "-y"]
+    env:
+      MINIMAX_API_KEY: "your-minimax-api-key-here"
+      MINIMAX_API_HOST: "https://api.minimaxi.com"
+
+# --- MCP 超时 ---
+mcp_timeout: 30
