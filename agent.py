@@ -20,6 +20,8 @@ sys.stdin.reconfigure(encoding='utf-8', errors='replace')
 import anthropic
 import subprocess
 import json
+import fnmatch
+import re
 import locale
 import urllib.request
 import warnings
@@ -28,6 +30,10 @@ import requests
 import chardet
 import time
 import threading
+from rich.console import Console
+from rich.markdown import Markdown as RichMarkdown
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
 from mcp_client import mcp_manager, print_lock as _print_lock
 
 class Colors:
@@ -59,6 +65,37 @@ _encoding = locale.getpreferredencoding(False) or 'utf-8'
 
 # 运行模式：'json' 或 'chat'
 _display_mode = 'chat'
+
+# 终端渲染和输入
+_rich_console = Console()
+
+from prompt_toolkit.key_binding import KeyBindings
+_input_bindings = KeyBindings()
+
+@_input_bindings.add('enter')
+def _submit(event):
+    """Enter 直接提交"""
+    event.current_buffer.validate_and_handle()
+
+@_input_bindings.add('c-j')
+def _newline_ctrl_enter(event):
+    """Ctrl+Enter 插入换行"""
+    event.current_buffer.insert_text('\n')
+
+_prompt_session = PromptSession(
+    multiline=True,
+    key_bindings=_input_bindings,
+    prompt_continuation=lambda width, line_number, is_soft_wrap: "... ",
+)
+
+
+def render_markdown(text: str):
+    """用 rich 渲染 Markdown 到终端，失败时 fallback 纯文本"""
+    try:
+        md = RichMarkdown(text, code_theme="monokai")
+        _rich_console.print(md)
+    except Exception:
+        print(f"{Colors.GREEN}{text}{Colors.ENDC}")
 
 
 # ============================================================================
@@ -263,6 +300,34 @@ tools = [
             },
             "required": ["path", "old_string", "new_string"]
         }
+    },
+    {
+        "name": "list_dir",
+        "description": "列出目录内容，返回文件和子目录列表。每项标注类型（[文件]/[目录]）和大小。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "目录路径，相对路径基于当前工作目录。默认为当前工作目录"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "grep_search",
+        "description": (
+            "在文件内容中搜索匹配的文本或正则表达式。"
+            "递归搜索目录下所有文本文件，返回匹配的文件名、行号和内容。"
+            "适合查找函数定义、变量引用、import 语句等。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "搜索模式，支持 Python 正则表达式"},
+                "path": {"type": "string", "description": "搜索起始路径（文件或目录），默认当前工作目录"},
+                "file_pattern": {"type": "string", "description": "文件名过滤（glob 模式），如 '*.py'、'*.js'。不指定则搜索所有文本文件"}
+            },
+            "required": ["pattern"]
+        }
     }
 ]
 
@@ -392,6 +457,95 @@ def execute_edit_file(path: str, old_string: str, new_string: str) -> str:
         return f"编辑错误: {str(e)}"
 
 
+_SKIP_DIRS = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', 'dist', 'build', '.idea', '.vscode'}
+_BINARY_EXT = {'.exe', '.dll', '.so', '.pyc', '.pyd', '.zip', '.tar', '.gz', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.bmp', '.pdf', '.woff', '.woff2', '.ttf'}
+
+
+def execute_list_dir(path: str = ".") -> str:
+    try:
+        full_path = path if os.path.isabs(path) else os.path.join(_cwd, path)
+        if not os.path.isdir(full_path):
+            return f"目录不存在: {full_path}"
+        entries = sorted(os.listdir(full_path))
+        if not entries:
+            return "（空目录）"
+        lines = []
+        for name in entries:
+            fp = os.path.join(full_path, name)
+            if os.path.isdir(fp):
+                lines.append(f"[目录] {name}")
+            else:
+                size = os.path.getsize(fp)
+                if size < 1024:
+                    s = f"{size}B"
+                elif size < 1024 * 1024:
+                    s = f"{size/1024:.1f}KB"
+                else:
+                    s = f"{size/1024/1024:.1f}MB"
+                lines.append(f"[文件] {name} ({s})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"目录读取错误: {str(e)}"
+
+
+def execute_grep_search(pattern: str, path: str = ".", file_pattern: str = None) -> str:
+    try:
+        full_path = path if os.path.isabs(path) else os.path.join(_cwd, path)
+        try:
+            regex = re.compile(pattern)
+        except re.error as e:
+            return f"正则表达式错误: {e}"
+
+        matches = []
+        max_matches = 100
+
+        def search_file(filepath):
+            if os.path.splitext(filepath)[1].lower() in _BINARY_EXT:
+                return
+            try:
+                with open(filepath, 'rb') as f:
+                    raw = f.read(256 * 1024)
+                try:
+                    text = raw.decode('utf-8')
+                except UnicodeDecodeError:
+                    detected = chardet.detect(raw)
+                    enc = detected.get("encoding") or 'gbk'
+                    text = raw.decode(enc, errors='replace')
+                for i, line in enumerate(text.splitlines(), 1):
+                    if regex.search(line):
+                        rel = os.path.relpath(filepath, _cwd)
+                        matches.append(f"{rel}:{i}: {line.rstrip()}")
+                        if len(matches) >= max_matches:
+                            return
+            except Exception:
+                pass
+
+        if os.path.isfile(full_path):
+            search_file(full_path)
+        elif os.path.isdir(full_path):
+            for root, dirs, files in os.walk(full_path):
+                dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+                for fname in files:
+                    if file_pattern and not fnmatch.fnmatch(fname, file_pattern):
+                        continue
+                    search_file(os.path.join(root, fname))
+                    if len(matches) >= max_matches:
+                        break
+                if len(matches) >= max_matches:
+                    break
+        else:
+            return f"路径不存在: {full_path}"
+
+        if not matches:
+            return "未找到匹配"
+        result = "\n".join(matches)
+        if len(matches) >= max_matches:
+            result += f"\n\n（结果已截断，仅显示前 {max_matches} 条匹配）"
+        return result
+    except Exception as e:
+        return f"搜索错误: {str(e)}"
+
+
 def execute_web_fetch(url: str) -> str:
     try:
         jina_url = f"https://r.jina.ai/{url}"
@@ -437,6 +591,10 @@ def process_tool_call(tool_name: str, tool_input: dict) -> str:
         return execute_read_file(tool_input["path"])
     if tool_name == "edit_file":
         return execute_edit_file(tool_input["path"], tool_input["old_string"], tool_input["new_string"])
+    if tool_name == "list_dir":
+        return execute_list_dir(tool_input.get("path", "."))
+    if tool_name == "grep_search":
+        return execute_grep_search(tool_input["pattern"], tool_input.get("path", "."), tool_input.get("file_pattern"))
     if tool_name == "web_fetch":
         return execute_web_fetch(tool_input["url"])
     if tool_name == "web_search":
@@ -544,9 +702,10 @@ def build_system_prompt() -> str:
         "4. 多条命令用 && 连接\n"
         "5. cd 命令会持久改变工作目录，后续命令在新目录执行\n"
         "6. 编辑文件时，优先使用 edit_file 进行精确修改，避免用 write_file 整文件重写\n"
+        "7. 查看目录结构用 list_dir，搜索代码内容用 grep_search，比 bash 更稳定\n"
         "\n回复格式规则：\n"
-        "- 禁止使用 Markdown 格式，不要用 **加粗**、*斜体*、# 标题、- 列表符号等\n"
-        "- 纯文本输出即可\n"
+        "- 使用 Markdown 格式回复（标题、列表、粗体、代码块等），终端会正确渲染\n"
+        "- 代码块请标注语言（如 ```python），以便语法高亮\n"
     )
 
 
@@ -724,18 +883,30 @@ def main():
     print("  • 读取文件（chardet 自动识别编码，支持 UTF-8/GBK 等）")
     print("  • 写入文件（原生 open 写入，避免 shell 重定向编码问题）")
     print("  • 编辑文件（edit_file 精确替换，避免整文件重写）")
+    print("  • 目录浏览（list_dir 列出目录内容，无编码问题）")
+    print("  • 代码搜索（grep_search 正则搜索文件内容，支持文件名过滤）")
     print("  • 读取网页内容（Jina Reader API 转 Markdown）")
     print("  • 进行网络搜索（Tavily Search API）")
     print("  • 上下文管理（自动估算 token，超预算时裁剪早期历史）")
     print("  • 图片理解（MiniMAX MCP）")
+    print("  • Markdown 渲染（rich 终端渲染，代码块语法高亮）")
+    print("  • 多行输入（支持粘贴大段文本，Ctrl+Enter 换行，Enter 提交）")
     mcp_tools = mcp_manager.get_tool_definitions()
     if mcp_tools:
         print(f"  • MCP 工具（{len(mcp_tools)} 个来自远程服务器，动态注册到工具列表）")
     print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.ENDC}\n")
-    print("输入 'exit' 退出\n")
+    print("输入 'exit' 退出 | Ctrl+Enter 换行，Enter 提交\n")
 
     while True:
-        user_input = input(f"{Colors.BOLD}{Colors.GREEN}你: {Colors.ENDC}").strip()
+        try:
+            user_input = _prompt_session.prompt(
+                HTML("<b><green>你: </green></b>"),
+            ).strip()
+        except KeyboardInterrupt:
+            continue
+        except EOFError:
+            print(f"{Colors.BOLD}{Colors.CYAN}再见!{Colors.ENDC}")
+            break
         if user_input.lower() == "exit":
             print(f"{Colors.BOLD}{Colors.CYAN}再见!{Colors.ENDC}")
             break
@@ -757,7 +928,11 @@ def main():
         print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*80}")
         print("🎯 最终回复")
         print(f"{'='*80}{Colors.ENDC}")
-        print(f"{Colors.GREEN}{response}{Colors.ENDC}\n")
+        if _display_mode == 'json':
+            print(f"{Colors.GREEN}{response}{Colors.ENDC}\n")
+        else:
+            render_markdown(response)
+            print()
 
 if __name__ == "__main__":
     main()
