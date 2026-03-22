@@ -230,7 +230,7 @@ tools = [
     },
     {
         "name": "write_file",
-        "description": "写入文件内容。默认直接覆盖(write)，尾部追加(append)。\n严格限制：每次调用此工具时，content 参数的长度不得超过 4000 tokens（约 3000 字符）。\n对于较长的内容，必须分多次调用：第一次用 mode=\"write\" 写入前面部分，后续用 mode=\"append\" 每次追加不超过 4000 tokens。\n违反此限制会导致输出内容丢失。",
+        "description": "写入文件内容。默认直接覆盖(write)，尾部追加(append)。\n严格限制：每次调用此工具时，content 参数的长度不得超过 4000 tokens（约 3000 字符）。\n对于较长的内容，必须分多次调用：第一次用 mode=\"write\" 写入前面部分，后续用 mode=\"append\" 每次追加不超过 4000 tokens（约 3000 字符）。\n违反此限制会导致输出内容丢失。",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -445,13 +445,6 @@ def execute_bash(command: str) -> str:
 
 
 def execute_write_file(path: str, content: str, mode: str = "write") -> str:
-    MAX_CONTENT_LEN = 3000
-    if len(content) > MAX_CONTENT_LEN:
-        return (
-            f"错误：content 长度 {len(content)} 字符，超过单次限制 {MAX_CONTENT_LEN} 字符，内容已被丢弃未写入。"
-            f"请分多次调用：首次 mode=\"write\" 写入前 {MAX_CONTENT_LEN} 字符，"
-            f"后续用 mode=\"append\" 逐批追加，每次不超过 {MAX_CONTENT_LEN} 字符。"
-        )
     try:
         full_path = path if os.path.isabs(path) else os.path.join(_cwd, path)
         parent = os.path.dirname(full_path)
