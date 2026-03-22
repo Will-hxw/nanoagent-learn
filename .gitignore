@@ -50,4 +50,5 @@ logs/
 config.yaml
 config.local.py
 
-function.md
+test/
+doc/

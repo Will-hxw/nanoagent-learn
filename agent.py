@@ -235,12 +235,13 @@ tools = [
     },
     {
         "name": "write_file",
-        "description": "将文本内容写入文件（创建或覆盖）。避免 shell 重定向的编码问题。",
+        "description": "写入文件内容。默认覆盖(write)，可追加(append)。重要：对于超过50行的内容，必须分多次调用：第一次用 mode=\"write\" 写入前50行，后续用 mode=\"append\" 每次追加不超过50行。",
         "input_schema": {
             "type": "object",
             "properties": {
                 "path":    {"type": "string", "description": "文件路径，相对路径基于当前工作目录"},
-                "content": {"type": "string", "description": "要写入的文本内容"}
+                "content": {"type": "string", "description": "要写入的文本内容"},
+                "mode":    {"type": "string", "enum": ["write", "append"], "description": "写入模式：write（覆盖，默认）或 append（追加）"}
             },
             "required": ["path", "content"]
         }
@@ -258,7 +259,7 @@ tools = [
     },
     {
         "name": "web_fetch",
-        "description": "Read and extract clean content from any URL using Jina Reader. Returns markdown-formatted text. Good for reading web pages, articles, documentation.",
+        "description": "读取并提取任意URL的网页内容，返回 Markdown 格式的文本。适合阅读网页、文章、技术文档等。",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -398,15 +399,22 @@ def execute_bash(command: str) -> str:
         return json.dumps({"stdout": "", "stderr": f"执行错误: {str(e)}", "returncode": -1, "cwd": _cwd}, ensure_ascii=False)
 
 
-def execute_write_file(path: str, content: str) -> str:
+def execute_write_file(path: str, content: str, mode: str = "write") -> str:
     try:
         full_path = path if os.path.isabs(path) else os.path.join(_cwd, path)
         parent = os.path.dirname(full_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(full_path, 'w', encoding='utf-8') as f:
+        # Warn if overwriting an existing file in write mode
+        existed = os.path.isfile(full_path)
+        file_mode = 'a' if mode == 'append' else 'w'
+        with open(full_path, file_mode, encoding='utf-8') as f:
             f.write(content)
-        return f"文件已写入: {full_path}"
+        action = "追加" if mode == 'append' else "写入"
+        msg = f"文件已{action}: {full_path}"
+        if mode == 'write' and existed:
+            msg += "（注意：已覆盖原有文件）"
+        return msg
     except Exception as e:
         return f"写入错误: {str(e)}"
 
@@ -612,7 +620,7 @@ def process_tool_call(tool_name: str, tool_input: dict) -> str:
     if tool_name == "bash":
         return execute_bash(tool_input["command"])
     if tool_name == "write_file":
-        return execute_write_file(tool_input["path"], tool_input["content"])
+        return execute_write_file(tool_input["path"], tool_input["content"], tool_input.get("mode", "write"))
     if tool_name == "read_file":
         return execute_read_file(tool_input["path"])
     if tool_name == "edit_file":
@@ -724,18 +732,24 @@ def build_system_prompt() -> str:
         f"- 用户：{os.environ.get('USERNAME', 'unknown')}\n"
         f"- CMD输出编码：{_encoding}\n"
         f"- Python：{_get_python_info()}\n"
-        f"- 工作目录文件：{_get_cwd_files()}\n\n"
-        "执行命令规则：\n"
+        f"- 工作目录文件：{_get_cwd_files()}\n"
+        f"- 单次回复token上限：{config.get('api.max_tokens', 2048)}（超出会被截断，请控制每次回复长度）\n\n"
+        "工具使用规则：\n"
         "1. 使用标准 Windows CMD 语法（不是 PowerShell，不是 bash）\n"
         "2. 写入文件时，必须使用 write_file 工具，不要用 echo > 重定向\n"
         "3. 路径分隔符用反斜杠 \\ 或正斜杠 / 均可\n"
         "4. 多条命令用 && 连接\n"
         "5. cd 命令会持久改变工作目录，后续命令在新目录执行\n"
-        "6. 编辑文件时，优先使用 edit_file 进行精确修改，避免用 write_file 整文件重写\n"
+        "6. 读取文件内容用 read_file，不要用 bash + type\n"
         "7. 查看目录结构用 list_dir，搜索代码内容用 grep_search，比 bash 更稳定\n"
+        "8. 修改已有文件的局部内容，优先用 edit_file 精确修改；创建新文件或需要完整重写已有文件时，用 write_file 分批写入（第一次 mode=\"write\" 写前50行，后续 mode=\"append\" 每次追加不超过50行），绝对不要在一次 write_file 调用中写入超过50行\n"
+        "9. 文件操作前先用 list_dir 确认目标目录结构，避免在错误路径创建文件或重复嵌套目录（如在 test/ 里再建 test/）\n"
+        "10. 查询网页内容用 web_fetch，搜索互联网信息用 web_search\n"
         "\n回复格式规则（终端可渲染Markdown）：\n"
+        "- 使用中文回复\n"
         "- 使用 Markdown 格式回复（标题、列表、粗体、代码块等），终端会正确渲染\n"
         "- 代码块请标注语言（如 ```python），以便语法高亮\n"
+        "- 控制单次回复在合理长度内，避免被截断\n"
     )
 
 
@@ -919,16 +933,51 @@ def chat(user_message: str, model: str = None) -> str:
 
     _interrupted.clear()
 
+    max_continuation_retries = 3
+    continuation_count = 0
+
     call_count += 1
     print_context(conversation_history, all_tools, call_count, model)
     response = _call_with_retry(model, all_tools, conversation_history)
     if response is None:
         return ""
 
-    while response.stop_reason == "tool_use":
+    while response.stop_reason in ("tool_use", "max_tokens"):
         if _interrupted.is_set():
             break
 
+        # --- 截断续传：max_tokens 时自动请求模型继续 ---
+        if response.stop_reason == "max_tokens":
+            safe_content = []
+            for block in response.content:
+                if block.type == "text":
+                    safe_content.append({"type": "text", "text": block.text})
+                elif block.type == "tool_use":
+                    safe_content.append({
+                        "type": "text",
+                        "text": f"[工具调用 {block.name} 因长度限制被截断]"
+                    })
+            conversation_history.append({"role": "assistant", "content": safe_content})
+            conversation_history.append({
+                "role": "user",
+                "content": "你的回复因长度限制被截断了。请从截断处继续，不要重复已输出的内容。如果工具调用被截断，请重新发起完整的工具调用。"
+            })
+
+            continuation_count += 1
+            if continuation_count > max_continuation_retries:
+                print(f"  {Colors.YELLOW}⚠ 多次截断续传仍未完成，停止重试{Colors.ENDC}")
+                break
+
+            print(f"  {Colors.YELLOW}⚠ 输出被截断，自动请求继续...{Colors.ENDC}")
+            call_count += 1
+            print_context(conversation_history, all_tools, call_count, model)
+            response = _call_with_retry(model, all_tools, conversation_history)
+            if response is None:
+                return ""
+            continue
+
+        # --- 正常 tool_use 处理 ---
+        continuation_count = 0
         conversation_history.append({"role": "assistant", "content": response.content})
 
         tool_results = []
@@ -947,13 +996,14 @@ def chat(user_message: str, model: str = None) -> str:
                     print(f"\n{Colors.BOLD}{Colors.CYAN}🔧 执行工具: {block.name}{Colors.ENDC}")
                     print(f"{Colors.CYAN}   工作目录: {_cwd}{Colors.ENDC}")
                 else:
-                    print(f"  {Colors.CYAN}◆ {block.name}...{Colors.ENDC}", end='', flush=True)
+                    # 先清除当前行（流式阶段可能已打印工具名），再重新打印
+                    print(f"\r{' ' * 80}\r  {Colors.CYAN}◆ {block.name}...{Colors.ENDC}", end='', flush=True)
                 tool_result = process_tool_call(block.name, block.input)
                 tool_result = truncate_tool_result(tool_result)
                 if _display_mode == 'json':
                     print(f"{Colors.GREEN}✓ 工具执行结果:{Colors.ENDC}\n{tool_result}\n")
                 else:
-                    print(f"\r  {Colors.GREEN}✓ {block.name}{Colors.ENDC}          ")
+                    print(f"\r{' ' * 80}\r  {Colors.GREEN}✓ {block.name}{Colors.ENDC}")
                 is_error = False
                 if block.name == "bash":
                     try:
@@ -981,6 +1031,8 @@ def chat(user_message: str, model: str = None) -> str:
             return ""
 
     final_response = "".join(block.text for block in response.content if hasattr(block, "text"))
+    if response.stop_reason == "max_tokens":
+        final_response += "\n\n[注意：回复因长度限制被截断，可能不完整。]"
     conversation_history.append({"role": "assistant", "content": final_response})
 
     if _interrupted.is_set():
