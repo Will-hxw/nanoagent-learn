@@ -241,6 +241,28 @@ tools = [
             },
             "required": ["query"]
         }
+    },
+    {
+        "name": "edit_file",
+        "description": (
+            "对已有文件进行精确编辑，通过字符串匹配定位并替换内容。\n"
+            "用法：\n"
+            "1. 替换：提供 old_string 和 new_string\n"
+            "2. 删除：old_string 为要删除的内容，new_string 设为空字符串\n"
+            "3. 插入：old_string 为插入点附近的已有文本，new_string 为该文本加上要插入的新内容\n"
+            "注意：old_string 必须与文件内容完全匹配（包括缩进和换行）。"
+            "如果匹配到多处会报错，请提供更多上下文使 old_string 唯一。"
+            "编辑前请先用 read_file 查看文件内容。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "文件路径，相对路径基于当前工作目录"},
+                "old_string": {"type": "string", "description": "要被替换的原始文本，必须与文件内容完全匹配"},
+                "new_string": {"type": "string", "description": "替换后的新文本，留空表示删除 old_string"}
+            },
+            "required": ["path", "old_string", "new_string"]
+        }
     }
 ]
 
@@ -320,6 +342,56 @@ def execute_read_file(path: str) -> str:
         return f"读取错误: {str(e)}"
 
 
+def execute_edit_file(path: str, old_string: str, new_string: str) -> str:
+    try:
+        full_path = path if os.path.isabs(path) else os.path.join(_cwd, path)
+
+        # old_string 为空 → 创建新文件
+        if not old_string:
+            if os.path.exists(full_path):
+                return f"错误：文件已存在: {full_path}，如需编辑请提供 old_string"
+            parent = os.path.dirname(full_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(new_string)
+            return f"新文件已创建: {full_path}"
+
+        # 编辑已有文件
+        if not os.path.isfile(full_path):
+            return f"文件不存在: {full_path}"
+
+        with open(full_path, 'rb') as f:
+            raw = f.read()
+        try:
+            content = raw.decode('utf-8')
+            encoding = 'utf-8'
+        except UnicodeDecodeError:
+            detected = chardet.detect(raw)
+            encoding = detected.get("encoding") or 'gbk'
+            content = raw.decode(encoding, errors='replace')
+
+        # 检查匹配次数
+        count = content.count(old_string)
+        if count == 0:
+            return "错误：未找到匹配文本，请检查 old_string 是否与文件内容完全一致（包括缩进、换行、空格）"
+        if count > 1:
+            return f"错误：old_string 匹配到 {count} 处，请提供更多上下文使其唯一"
+
+        # 执行替换并写回
+        new_content = content.replace(old_string, new_string, 1)
+        with open(full_path, 'w', encoding=encoding) as f:
+            f.write(new_content)
+
+        old_lines = old_string.count('\n') + 1
+        new_lines = new_string.count('\n') + 1
+        if not new_string:
+            return f"已删除 {old_lines} 行内容: {full_path}"
+        return f"已编辑: {full_path}（{old_lines} 行 → {new_lines} 行）"
+    except Exception as e:
+        return f"编辑错误: {str(e)}"
+
+
 def execute_web_fetch(url: str) -> str:
     try:
         jina_url = f"https://r.jina.ai/{url}"
@@ -363,6 +435,8 @@ def process_tool_call(tool_name: str, tool_input: dict) -> str:
         return execute_write_file(tool_input["path"], tool_input["content"])
     if tool_name == "read_file":
         return execute_read_file(tool_input["path"])
+    if tool_name == "edit_file":
+        return execute_edit_file(tool_input["path"], tool_input["old_string"], tool_input["new_string"])
     if tool_name == "web_fetch":
         return execute_web_fetch(tool_input["url"])
     if tool_name == "web_search":
@@ -469,6 +543,7 @@ def build_system_prompt() -> str:
         "3. 路径分隔符用反斜杠 \\ 或正斜杠 / 均可\n"
         "4. 多条命令用 && 连接\n"
         "5. cd 命令会持久改变工作目录，后续命令在新目录执行\n"
+        "6. 编辑文件时，优先使用 edit_file 进行精确修改，避免用 write_file 整文件重写\n"
         "\n回复格式规则：\n"
         "- 禁止使用 Markdown 格式，不要用 **加粗**、*斜体*、# 标题、- 列表符号等\n"
         "- 纯文本输出即可\n"
@@ -648,9 +723,11 @@ def main():
     print("  • 执行CMD命令（subprocess + 持久工作目录）")
     print("  • 读取文件（chardet 自动识别编码，支持 UTF-8/GBK 等）")
     print("  • 写入文件（原生 open 写入，避免 shell 重定向编码问题）")
+    print("  • 编辑文件（edit_file 精确替换，避免整文件重写）")
     print("  • 读取网页内容（Jina Reader API 转 Markdown）")
     print("  • 进行网络搜索（Tavily Search API）")
     print("  • 上下文管理（自动估算 token，超预算时裁剪早期历史）")
+    print("  • 图片理解（MiniMAX MCP）")
     mcp_tools = mcp_manager.get_tool_definitions()
     if mcp_tools:
         print(f"  • MCP 工具（{len(mcp_tools)} 个来自远程服务器，动态注册到工具列表）")
