@@ -43,8 +43,6 @@ client = anthropic.Anthropic(
     api_key="sk-cp-N0a9hAUNXsnOun0mxby9_R9ESe_V6hDhZJ5VNuOEpVV_rqFTMXmnsElpXDX6IV_DuBwI6U4_k0ce6P4Wn3DTEVwiRjaIhJF2OfX688MXScwY3eypkXx2sXY",
     base_url="https://api.minimaxi.com/anthropic"
 )
-    # api_key="sk-sp-f8a97e8602d343f68eef487e13ef5c24",
-    # base_url="https://coding.dashscope.aliyuncs.com/apps/anthropic"
 
     # api_key="sk-udhHZddO7Y79ZQEPhd3JJnIt6idrmn5FYoSVQIv8ZAYiJpNe",
     # base_url="https://codeflow.asia"

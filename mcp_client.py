@@ -8,8 +8,9 @@ MCP 客户端模块 - 管理远程 MCP 服务器连接和工具调用
 import asyncio
 import threading
 import json
-from mcp import ClientSession
+from mcp import ClientSession, StdioServerParameters
 from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.stdio import stdio_client
 
 
 # ============================================================================
@@ -42,6 +43,16 @@ MCP_SERVERS = [
         "headers": {
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
+        },
+    },
+    {
+        "name": "minimax",
+        "type": "stdio",
+        "command": "uvx",
+        "args": ["minimax-coding-plan-mcp", "-y"],
+        "env": {
+            "MINIMAX_API_KEY": "sk-cp-N0a9hAUNXsnOun0mxby9_R9ESe_V6hDhZJ5VNuOEpVV_rqFTMXmnsElpXDX6IV_DuBwI6U4_k0ce6P4Wn3DTEVwiRjaIhJF2OfX688MXScwY3eypkXx2sXY",
+            "MINIMAX_API_HOST": "https://api.minimaxi.com",
         },
     },
 ]
@@ -85,11 +96,20 @@ class MCPManager:
     async def _connect_server(self, config: dict):
         """连接单个 MCP 服务器，发现工具"""
         name = config["name"]
-        url = config["url"]
-        headers = config["headers"]
 
-        transport_ctx = streamablehttp_client(url=url, headers=headers)
-        read_stream, write_stream, _ = await transport_ctx.__aenter__()
+        if config.get("type") == "stdio":
+            params = StdioServerParameters(
+                command=config["command"],
+                args=config.get("args", []),
+                env=config.get("env"),
+            )
+            transport_ctx = stdio_client(params)
+            read_stream, write_stream = await transport_ctx.__aenter__()
+        else:
+            url = config["url"]
+            headers = config["headers"]
+            transport_ctx = streamablehttp_client(url=url, headers=headers)
+            read_stream, write_stream, _ = await transport_ctx.__aenter__()
         self._contexts.append(transport_ctx)
 
         session_ctx = ClientSession(read_stream, write_stream)
