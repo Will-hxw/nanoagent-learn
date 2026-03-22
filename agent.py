@@ -30,6 +30,7 @@ import requests
 import chardet
 import time
 import threading
+import signal
 from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
 from prompt_toolkit import PromptSession
@@ -57,8 +58,16 @@ conversation_history = []
 call_count = 0
 token_stats = {"total_input": 0, "total_output": 0}
 
+# 中断控制
+_interrupted = threading.Event()
+# streaming 是否可用（首次失败后永久降级）
+_streaming_available = True
+
 # 当前工作目录，跨命令持久化，支持 cd 切换
 _cwd = os.getcwd()
+
+# 哨兵标记：用于从 subprocess 输出中提取子进程最终工作目录
+_CWD_SENTINEL = "===CWD_SYNC==="
 
 # chcp 65001 之后取值，反映实际代码页；fallback 用 utf-8
 _encoding = locale.getpreferredencoding(False) or 'utf-8'
@@ -336,42 +345,56 @@ tools = [
 # 工具执行
 # ============================================================================
 
+def _decode_bytes(b: bytes) -> str:
+    """解码子进程输出字节，优先 UTF-8，fallback chardet 检测"""
+    if not b:
+        return ""
+    try:
+        return b.decode('utf-8')
+    except UnicodeDecodeError:
+        detected = chardet.detect(b)
+        enc = detected.get("encoding") or 'gbk'
+        return b.decode(enc, errors='replace')
+
+
 def execute_bash(command: str) -> str:
     global _cwd
     try:
-        stripped = command.strip()
-        # 纯 cd 命令：更新持久工作目录
-        if stripped.lower().startswith("cd ") and "&" not in stripped:
-            target = stripped[3:].strip().strip('"').strip("'")
-            new_dir = os.path.normpath(os.path.join(_cwd, target))
-            if os.path.isdir(new_dir):
-                _cwd = new_dir
-                return f"已切换到: {_cwd}"
-            return f"目录不存在: {new_dir}"
+        # 在命令末尾追加哨兵 + cd，用 & (非 &&) 确保即使命令失败也能拿到目录
+        injected = f'{command} & echo {_CWD_SENTINEL} & cd'
 
         result = subprocess.run(
-            command,
+            injected,
             shell=True,
             capture_output=True,
             cwd=_cwd,
             timeout=30,
         )
-        def decode_bytes(b):
-            if not b:
-                return ""
-            try:
-                return b.decode('utf-8')
-            except UnicodeDecodeError:
-                detected = chardet.detect(b)
-                enc = detected.get("encoding") or 'gbk'
-                return b.decode(enc, errors='replace')
-        output = decode_bytes(result.stdout) + decode_bytes(result.stderr)
-        return output.strip() or "命令执行成功，无输出"
+
+        stdout_text = _decode_bytes(result.stdout)
+        stderr_text = _decode_bytes(result.stderr).strip()
+
+        # 从 stdout 提取哨兵后的工作目录，并分离用户输出
+        user_output = stdout_text
+        if _CWD_SENTINEL in stdout_text:
+            parts = stdout_text.split(_CWD_SENTINEL, 1)
+            user_output = parts[0]
+            after = parts[1]
+            for line in after.splitlines():
+                line = line.strip()
+                if line and os.path.isdir(line):
+                    _cwd = os.path.normpath(line)
+                    break
+
+        stdout = user_output.strip()
+        if not stdout and not stderr_text and result.returncode == 0:
+            stdout = "命令执行成功，无输出"
+        return json.dumps({"stdout": stdout, "stderr": stderr_text, "returncode": result.returncode, "cwd": _cwd}, ensure_ascii=False)
 
     except subprocess.TimeoutExpired:
-        return "命令执行超时（30s）"
+        return json.dumps({"stdout": "", "stderr": "命令执行超时（30s）", "returncode": -1, "cwd": _cwd}, ensure_ascii=False)
     except Exception as e:
-        return f"执行错误: {str(e)}"
+        return json.dumps({"stdout": "", "stderr": f"执行错误: {str(e)}", "returncode": -1, "cwd": _cwd}, ensure_ascii=False)
 
 
 def execute_write_file(path: str, content: str) -> str:
@@ -709,6 +732,175 @@ def build_system_prompt() -> str:
     )
 
 
+# ============================================================================
+# 流式输出
+# ============================================================================
+
+def _print_stream_event_chat(event):
+    """chat 模式：工具调用时打印工具名，文本不实时打印（收集后统一渲染）"""
+    if event.type == "content_block_start":
+        block = event.content_block
+        if block.type == "tool_use":
+            print(f"  {Colors.CYAN}◆ {block.name}...{Colors.ENDC}", end='', flush=True)
+
+
+def _print_stream_event_json(event):
+    """json 模式：打印每个 streaming event"""
+    event_data = {"type": event.type}
+    if event.type == "message_start":
+        msg = event.message
+        event_data["message"] = {"id": msg.id, "model": msg.model, "role": msg.role}
+    elif event.type == "content_block_start":
+        block = event.content_block
+        event_data["content_block"] = {"type": block.type}
+        if block.type == "tool_use":
+            event_data["content_block"]["name"] = block.name
+            event_data["content_block"]["id"] = block.id
+    elif event.type == "content_block_delta":
+        delta = event.delta
+        event_data["delta"] = {"type": delta.type}
+        if hasattr(delta, 'text'):
+            event_data["delta"]["text"] = delta.text
+        if hasattr(delta, 'partial_json'):
+            event_data["delta"]["partial_json"] = delta.partial_json
+    elif event.type == "message_delta":
+        event_data["stop_reason"] = event.delta.stop_reason
+        if hasattr(event, 'usage') and event.usage:
+            event_data["usage"] = {"output_tokens": event.usage.output_tokens}
+    else:
+        return  # 跳过不关心的事件类型
+    print(f"  {Colors.CYAN}[SSE]{Colors.ENDC} {json.dumps(event_data, ensure_ascii=False)}")
+
+
+def _print_token_stats_streaming(message):
+    """流式完成后打印 token 统计（json 模式）"""
+    if not hasattr(message, 'usage'):
+        return
+    usage = message.usage
+    print(f"\n{Colors.BOLD}{Colors.CYAN}【Token 统计】{Colors.ENDC}")
+    print(f"  本次输入: {usage.input_tokens} tokens")
+    print(f"  本次输出: {usage.output_tokens} tokens")
+    print(f"  累计输入: {token_stats['total_input']} tokens")
+    print(f"  累计输出: {token_stats['total_output']} tokens")
+    print()
+
+
+def stream_chat_response(model, all_tools, system_prompt, messages):
+    """流式调用 API，chat模式等首token后收集完整响应再渲染，json模式实时打印event。"""
+    global _streaming_available
+
+    if not _streaming_available:
+        return _fallback_non_stream(model, all_tools, system_prompt, messages)
+
+    try:
+        with client.messages.stream(
+            model=model,
+            max_tokens=2048,
+            system=system_prompt,
+            tools=all_tools,
+            messages=messages,
+        ) as stream:
+            first_token_received = False
+            frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+            frame_idx = [0]
+            last_frame_time = [time.time()]
+
+            # chat 模式：等待首 token 时显示转圈
+            if _display_mode != 'json':
+                print(f"\r  {Colors.CYAN}{frames[0]} Agent 思考中...{Colors.ENDC}", end='', flush=True)
+
+            for event in stream:
+                if _interrupted.is_set():
+                    if not first_token_received and _display_mode != 'json':
+                        print("\r" + " " * 60 + "\r", end='', flush=True)
+                    stream.close()
+                    return None
+
+                if _display_mode == 'json':
+                    _print_stream_event_json(event)
+                else:
+                    # chat 模式：检测首个 text delta 到达
+                    if not first_token_received:
+                        is_text = (event.type == "content_block_delta"
+                                   and hasattr(event.delta, 'text'))
+                        is_tool = (event.type == "content_block_start"
+                                   and event.content_block.type == "tool_use")
+                        if is_text or is_tool:
+                            first_token_received = True
+                            print("\r" + " " * 60 + "\r", end='', flush=True)
+                            if is_text:
+                                print(f"  {Colors.GREEN}✓ Agent 思考完成{Colors.ENDC}")
+                        else:
+                            # 更新转圈动画
+                            now = time.time()
+                            if now - last_frame_time[0] >= 0.1:
+                                frame_idx[0] = (frame_idx[0] + 1) % len(frames)
+                                last_frame_time[0] = now
+                                print(f"\r  {Colors.CYAN}{frames[frame_idx[0]]} Agent 思考中...{Colors.ENDC}", end='', flush=True)
+                    _print_stream_event_chat(event)
+
+            if not first_token_received and _display_mode != 'json':
+                print("\r" + " " * 60 + "\r", end='', flush=True)
+                print(f"  {Colors.GREEN}✓ Agent 思考完成{Colors.ENDC}")
+
+            final_message = stream.get_final_message()
+            if hasattr(final_message, 'usage'):
+                token_stats["total_input"] += final_message.usage.input_tokens
+                token_stats["total_output"] += final_message.usage.output_tokens
+            if _display_mode == 'json':
+                _print_token_stats_streaming(final_message)
+            return final_message
+
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "stream" in err_msg or "not supported" in err_msg or "event" in err_msg:
+            _streaming_available = False
+            print(f"  {Colors.YELLOW}⚠ API 不支持 Streaming，已降级为普通模式{Colors.ENDC}")
+            return _fallback_non_stream(model, all_tools, system_prompt, messages)
+        raise
+
+
+def _fallback_non_stream(model, all_tools, system_prompt, messages):
+    """Streaming 不可用时的降级路径：阻塞调用 + 转圈动画"""
+    def api_call():
+        return client.messages.create(
+            model=model,
+            max_tokens=2048,
+            system=system_prompt,
+            tools=all_tools,
+            messages=messages,
+        )
+    response = show_loading_with_task(api_call, msg="Agent 思考中")
+    if response and hasattr(response, 'usage'):
+        token_stats["total_input"] += response.usage.input_tokens
+        token_stats["total_output"] += response.usage.output_tokens
+    if _display_mode == 'json' and response:
+        print_response(response, call_count)
+    return response
+
+
+def _call_with_retry(model, all_tools, messages):
+    """带重试的 API 调用，优先流式，失败降级"""
+    system_prompt = build_system_prompt()
+    max_retries = 3
+    for attempt in range(max_retries + 1):
+        try:
+            return stream_chat_response(model, all_tools, system_prompt, messages)
+        except anthropic.RateLimitError:
+            if attempt < max_retries:
+                wait = 2 ** (attempt + 1)
+                print(f"  {Colors.YELLOW}⚠ 限流，{wait}s 后重试...{Colors.ENDC}")
+                time.sleep(wait)
+                continue
+            raise
+        except anthropic.BadRequestError:
+            messages[:] = trim_history(messages, system_prompt, token_budget=80000)
+            return stream_chat_response(model, all_tools, system_prompt, messages)
+        except anthropic.PermissionDeniedError:
+            print(f"\n{Colors.RED}{Colors.BOLD}API欠费失效，请联系xiaoweihuacqu@gamil.com{Colors.ENDC}\n")
+            return None
+
+
 def chat(user_message: str, model: str = "MiniMax-M2.7") -> str:
     global call_count, conversation_history
     all_tools = tools + mcp_manager.get_tool_definitions()
@@ -716,51 +908,32 @@ def chat(user_message: str, model: str = "MiniMax-M2.7") -> str:
     conversation_history.append({"role": "user", "content": user_message})
     conversation_history = trim_history(conversation_history, build_system_prompt())
 
-    def safe_api_call():
-        global conversation_history
-        max_retries = 3
-        for attempt in range(max_retries + 1):
-            try:
-                return client.messages.create(
-                    model=model,
-                    max_tokens=2048,
-                    system=build_system_prompt(),
-                    tools=all_tools,
-                    messages=conversation_history
-                )
-            except anthropic.RateLimitError:
-                if attempt < max_retries:
-                    time.sleep(2 ** (attempt + 1))  # 2s, 4s, 8s
-                    continue
-                raise
-            except anthropic.BadRequestError:
-                conversation_history = trim_history(
-                    conversation_history, build_system_prompt(), token_budget=80000
-                )
-                return client.messages.create(
-                    model=model,
-                    max_tokens=2048,
-                    system=build_system_prompt(),
-                    tools=all_tools,
-                    messages=conversation_history
-                )
-            except anthropic.PermissionDeniedError:
-                print(f"\n{Colors.RED}{Colors.BOLD}API欠费失效，请联系xiaoweihuacqu@gamil.com{Colors.ENDC}\n")
-                return None
+    _interrupted.clear()
 
     call_count += 1
     print_context(conversation_history, all_tools, call_count, model)
-    response = show_loading_with_task(safe_api_call, msg="Agent 思考中")
+    response = _call_with_retry(model, all_tools, conversation_history)
     if response is None:
         return ""
-    print_response(response, call_count)
 
     while response.stop_reason == "tool_use":
+        if _interrupted.is_set():
+            break
+
         conversation_history.append({"role": "assistant", "content": response.content})
 
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
+                if _interrupted.is_set():
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": "用户已取消操作",
+                        "is_error": True,
+                    })
+                    continue
+
                 if _display_mode == 'json':
                     print(f"\n{Colors.BOLD}{Colors.CYAN}🔧 执行工具: {block.name}{Colors.ENDC}")
                     print(f"{Colors.CYAN}   工作目录: {_cwd}{Colors.ENDC}")
@@ -772,25 +945,38 @@ def chat(user_message: str, model: str = "MiniMax-M2.7") -> str:
                     print(f"{Colors.GREEN}✓ 工具执行结果:{Colors.ENDC}\n{tool_result}\n")
                 else:
                     print(f"\r  {Colors.GREEN}✓ {block.name}{Colors.ENDC}          ")
+                is_error = False
+                if block.name == "bash":
+                    try:
+                        is_error = json.loads(tool_result).get("returncode", 0) != 0
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": tool_result,
-                    "is_error": False
+                    "is_error": is_error,
                 })
 
         conversation_history.append({"role": "user", "content": tool_results})
+
+        if _interrupted.is_set():
+            break
+
         conversation_history = trim_history(conversation_history, build_system_prompt())
 
         call_count += 1
         print_context(conversation_history, all_tools, call_count, model)
-        response = show_loading_with_task(safe_api_call, msg="Agent 思考中")
+        response = _call_with_retry(model, all_tools, conversation_history)
         if response is None:
             return ""
-        print_response(response, call_count)
 
     final_response = "".join(block.text for block in response.content if hasattr(block, "text"))
     conversation_history.append({"role": "assistant", "content": final_response})
+
+    if _interrupted.is_set():
+        print(f"\n  {Colors.YELLOW}⚠ 已中断{Colors.ENDC}")
+
     return final_response
 
 
@@ -818,6 +1004,11 @@ def show_loading_with_task(task_func, msg: str = "正在预加载"):
 
     # 显示加载动画直到任务完成
     while task_thread.is_alive():
+        if _interrupted.is_set():
+            print("\r" + " " * 60 + "\r", end='', flush=True)
+            print(f"  {Colors.YELLOW}⚠ 等待当前请求完成...{Colors.ENDC}")
+            task_thread.join(timeout=5)
+            return result[0]
         with _print_lock:
             print(f"\r  {Colors.CYAN}{frames[idx % len(frames)]} {msg}...{Colors.ENDC}", end='', flush=True)
         idx += 1
@@ -895,7 +1086,7 @@ def main():
     if mcp_tools:
         print(f"  • MCP 工具（{len(mcp_tools)} 个来自远程服务器，动态注册到工具列表）")
     print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.ENDC}\n")
-    print("输入 'exit' 退出 | Ctrl+Enter 换行，Enter 提交\n")
+    print("输入 'exit' 退出 | Ctrl+C 中断当前任务 | Ctrl+Enter 换行，Enter 提交\n")
 
     while True:
         try:
@@ -914,6 +1105,16 @@ def main():
             continue
 
         print()
+
+        # 注册 Ctrl+C 信号处理：中断当前任务而非退出程序
+        original_handler = signal.getsignal(signal.SIGINT)
+
+        def interrupt_handler(signum, frame):
+            _interrupted.set()
+            print(f"\n  {Colors.YELLOW}⚠ 正在中断...{Colors.ENDC}", flush=True)
+
+        signal.signal(signal.SIGINT, interrupt_handler)
+
         try:
             response = chat(user_input)
         except anthropic.RateLimitError:
@@ -924,15 +1125,26 @@ def main():
             print(f"{Colors.YELLOW}已清空对话历史，请重新开始。{Colors.ENDC}")
             conversation_history.clear()
             continue
+        finally:
+            signal.signal(signal.SIGINT, original_handler)
+            _interrupted.clear()
 
-        print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*80}")
-        print("🎯 最终回复")
-        print(f"{'='*80}{Colors.ENDC}")
-        if _display_mode == 'json':
-            print(f"{Colors.GREEN}{response}{Colors.ENDC}\n")
-        else:
+        if not response:
+            continue
+
+        if _display_mode == 'chat':
+            # 收集完整响应后 Markdown 渲染
+            print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*80}")
+            print("🎯 最终回复")
+            print(f"{'='*80}{Colors.ENDC}")
             render_markdown(response)
             print()
+        else:
+            # json 模式保留完整最终回复
+            print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*80}")
+            print("🎯 最终回复")
+            print(f"{'='*80}{Colors.ENDC}")
+            print(f"{Colors.GREEN}{response}{Colors.ENDC}\n")
 
 if __name__ == "__main__":
     main()
