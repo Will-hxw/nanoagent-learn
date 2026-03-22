@@ -31,6 +31,7 @@ import chardet
 import time
 import threading
 import signal
+import concurrent.futures
 from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
 from prompt_toolkit import PromptSession
@@ -359,22 +360,72 @@ def _decode_bytes(b: bytes) -> str:
         return b.decode(enc, errors='replace')
 
 
+def _kill_process_tree(pid):
+    """Windows: 杀掉进程及其所有子进程"""
+    try:
+        subprocess.run(f"taskkill /F /T /PID {pid}", shell=True,
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
 def execute_bash(command: str) -> str:
     global _cwd
+    idle_timeout = config.get_tool_config("bash").get("timeout", 30)
     try:
-        # 在命令末尾追加哨兵 + cd，用 & (非 &&) 确保即使命令失败也能拿到目录
         injected = f'{command} & echo {_CWD_SENTINEL} & cd'
-
-        result = subprocess.run(
-            injected,
-            shell=True,
-            capture_output=True,
+        proc = subprocess.Popen(
+            injected, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=_cwd,
-            timeout=config.get_tool_config("bash").get("timeout", 30),
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
 
-        stdout_text = _decode_bytes(result.stdout)
-        stderr_text = _decode_bytes(result.stderr).strip()
+        stdout_chunks = []
+        stderr_chunks = []
+        last_activity = time.time()
+        timed_out = False
+
+        def _read_stream(stream, chunks):
+            nonlocal last_activity
+            while True:
+                line = stream.readline()
+                if not line:
+                    break
+                chunks.append(line)
+                last_activity = time.time()
+
+        stdout_thread = threading.Thread(target=_read_stream, args=(proc.stdout, stdout_chunks), daemon=True)
+        stderr_thread = threading.Thread(target=_read_stream, args=(proc.stderr, stderr_chunks), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # 主线程轮询：检查进程结束、空闲超时、用户中断
+        while proc.poll() is None:
+            if _interrupted.is_set():
+                _kill_process_tree(proc.pid)
+                timed_out = True
+                break
+            if time.time() - last_activity > idle_timeout:
+                _kill_process_tree(proc.pid)
+                timed_out = True
+                break
+            time.sleep(0.2)
+
+        stdout_thread.join(timeout=3)
+        stderr_thread.join(timeout=3)
+
+        if timed_out:
+            partial_text = _decode_bytes(b''.join(stdout_chunks)).strip()
+            if _interrupted.is_set():
+                msg = "用户已中断，已终止进程树"
+            else:
+                msg = f"命令空闲超时（{idle_timeout}s 无新输出），已终止进程树"
+            return json.dumps({"stdout": partial_text, "stderr": msg,
+                               "returncode": -1, "cwd": _cwd}, ensure_ascii=False)
+
+        stdout_text = _decode_bytes(b''.join(stdout_chunks))
+        stderr_text = _decode_bytes(b''.join(stderr_chunks)).strip()
 
         # 从 stdout 提取哨兵后的工作目录，并分离用户输出
         user_output = stdout_text
@@ -389,12 +440,10 @@ def execute_bash(command: str) -> str:
                     break
 
         stdout = user_output.strip()
-        if not stdout and not stderr_text and result.returncode == 0:
+        if not stdout and not stderr_text and proc.returncode == 0:
             stdout = "命令执行成功，无输出"
-        return json.dumps({"stdout": stdout, "stderr": stderr_text, "returncode": result.returncode, "cwd": _cwd}, ensure_ascii=False)
+        return json.dumps({"stdout": stdout, "stderr": stderr_text, "returncode": proc.returncode, "cwd": _cwd}, ensure_ascii=False)
 
-    except subprocess.TimeoutExpired:
-        return json.dumps({"stdout": "", "stderr": "命令执行超时（30s）", "returncode": -1, "cwd": _cwd}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"stdout": "", "stderr": f"执行错误: {str(e)}", "returncode": -1, "cwd": _cwd}, ensure_ascii=False)
 
@@ -557,8 +606,12 @@ def execute_grep_search(pattern: str, path: str = ".", file_pattern: str = None)
             search_file(full_path)
         elif os.path.isdir(full_path):
             for root, dirs, files in os.walk(full_path):
+                if _interrupted.is_set():
+                    break
                 dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
                 for fname in files:
+                    if _interrupted.is_set():
+                        break
                     if file_pattern and not fnmatch.fnmatch(fname, file_pattern):
                         continue
                     search_file(os.path.join(root, fname))
@@ -616,26 +669,45 @@ def execute_web_search(query: str, num_results: int = 15) -> str:
         return f"搜索错误: {str(e)}"
 
 
+def run_with_timeout(func, timeout_seconds, tool_name="unknown"):
+    """在子线程中执行工具函数，超时后返回错误"""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            return f"工具 {tool_name} 执行超时（{timeout_seconds}s）"
+
+
 def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    # bash 有自己的空闲超时机制，不需要外层包装
     if tool_name == "bash":
         return execute_bash(tool_input["command"])
-    if tool_name == "write_file":
-        return execute_write_file(tool_input["path"], tool_input["content"], tool_input.get("mode", "write"))
-    if tool_name == "read_file":
-        return execute_read_file(tool_input["path"])
-    if tool_name == "edit_file":
-        return execute_edit_file(tool_input["path"], tool_input["old_string"], tool_input["new_string"])
-    if tool_name == "list_dir":
-        return execute_list_dir(tool_input.get("path", "."))
-    if tool_name == "grep_search":
-        return execute_grep_search(tool_input["pattern"], tool_input.get("path", "."), tool_input.get("file_pattern"))
-    if tool_name == "web_fetch":
-        return execute_web_fetch(tool_input["url"])
-    if tool_name == "web_search":
-        return execute_web_search(tool_input["query"], tool_input.get("num_results", 15))
-    if mcp_manager.is_mcp_tool(tool_name):
-        return mcp_manager.call_tool(tool_name, tool_input)
-    return "未知工具"
+
+    # 其他工具用固定超时兜底
+    tool_cfg = config.get_tool_config(tool_name)
+    timeout = tool_cfg.get("timeout", config.get("tools_default_timeout", 60))
+
+    def _execute():
+        if tool_name == "write_file":
+            return execute_write_file(tool_input["path"], tool_input["content"], tool_input.get("mode", "write"))
+        if tool_name == "read_file":
+            return execute_read_file(tool_input["path"])
+        if tool_name == "edit_file":
+            return execute_edit_file(tool_input["path"], tool_input["old_string"], tool_input["new_string"])
+        if tool_name == "list_dir":
+            return execute_list_dir(tool_input.get("path", "."))
+        if tool_name == "grep_search":
+            return execute_grep_search(tool_input["pattern"], tool_input.get("path", "."), tool_input.get("file_pattern"))
+        if tool_name == "web_fetch":
+            return execute_web_fetch(tool_input["url"])
+        if tool_name == "web_search":
+            return execute_web_search(tool_input["query"], tool_input.get("num_results", 15))
+        if mcp_manager.is_mcp_tool(tool_name):
+            return mcp_manager.call_tool(tool_name, tool_input)
+        return "未知工具"
+
+    return run_with_timeout(_execute, timeout, tool_name)
 
 
 # ============================================================================
