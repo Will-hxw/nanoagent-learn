@@ -55,7 +55,7 @@ client = anthropic.Anthropic(
 
 conversation_history = []
 call_count = 0
-token_stats = {"total_input": 0, "total_output": 0}
+token_stats = {"total_input": 0, "total_output": 0, "last_input": 0}
 
 # 中断控制
 _interrupted = threading.Event()
@@ -141,7 +141,7 @@ def print_context(messages: list, tools: list, call_num: int, model: str):
     ]
     api_request = {
         "model": model,
-        "max_tokens": config.get("api.max_tokens", 2048),
+        "max_tokens": config.get("api.max_tokens", 8192),
         "system": build_system_prompt(),
         "tools": tools,
         "messages": serializable_messages,
@@ -230,7 +230,7 @@ tools = [
     },
     {
         "name": "write_file",
-        "description": "写入文件内容。默认覆盖(write)，可追加(append)。重要：对于超过50行的内容，必须分多次调用：第一次用 mode=\"write\" 写入前50行，后续用 mode=\"append\" 每次追加不超过50行。",
+        "description": "写入文件内容。默认直接覆盖(write)，尾部追加(append)。\n严格限制：每次调用此工具时，content 参数的长度不得超过 4000 tokens（约 3000 字符）。\n对于较长的内容，必须分多次调用：第一次用 mode=\"write\" 写入前面部分，后续用 mode=\"append\" 每次追加不超过 4000 tokens。\n违反此限制会导致输出内容丢失。",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -286,6 +286,8 @@ tools = [
         "name": "edit_file",
         "description": (
             "对已有文件进行精确编辑，通过字符串匹配定位并替换内容。\n"
+            "严格限制：每次调用此工具时，old_string 和 new_string 的总长度不得超过 4000 tokens（约 3000 字符）。\n"
+            "对于大范围修改，请拆分为多次小的 edit_file 调用，每次只修改一处。违反此限制会导致输出被截断、内容丢失。\n"
             "用法：\n"
             "1. 替换：提供 old_string 和 new_string\n"
             "2. 删除：old_string 为要删除的内容，new_string 设为空字符串\n"
@@ -443,6 +445,13 @@ def execute_bash(command: str) -> str:
 
 
 def execute_write_file(path: str, content: str, mode: str = "write") -> str:
+    MAX_CONTENT_LEN = 3000
+    if len(content) > MAX_CONTENT_LEN:
+        return (
+            f"错误：content 长度 {len(content)} 字符，超过单次限制 {MAX_CONTENT_LEN} 字符，内容已被丢弃未写入。"
+            f"请分多次调用：首次 mode=\"write\" 写入前 {MAX_CONTENT_LEN} 字符，"
+            f"后续用 mode=\"append\" 逐批追加，每次不超过 {MAX_CONTENT_LEN} 字符。"
+        )
     try:
         full_path = path if os.path.isabs(path) else os.path.join(_cwd, path)
         parent = os.path.dirname(full_path)
@@ -722,41 +731,29 @@ def truncate_tool_result(result: str, max_chars: int = None) -> str:
     )
 
 
-def estimate_tokens(messages: list, system_prompt: str = "") -> int:
-    """粗略估算 token 数，1 token ≈ 3 字符（偏保守，适合中英混合）"""
-    total_chars = len(system_prompt)
-    for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        elif isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict):
-                    total_chars += len(json.dumps(item, ensure_ascii=False))
-                else:
-                    total_chars += len(str(item))
-    return total_chars // 3
-
-
 def trim_history(messages: list, system_prompt: str, token_budget: int = None) -> list:
-    """超预算时裁剪早期历史，保留最近对话"""
+    """超预算时裁剪早期历史，保留最近对话。使用 API 返回的真实 token 数判断。"""
     if token_budget is None:
         token_budget = config.get("context.token_budget", 150000)
-    current = estimate_tokens(messages, system_prompt)
-    if current <= token_budget:
+    current = token_stats.get("last_input", 0)
+    if current <= 0 or current <= token_budget:
         return messages
 
-    print(f"\n{Colors.YELLOW}[上下文管理] 预估 {current} tokens，超过预算 {token_budget}，开始裁剪...{Colors.ENDC}")
+    print(f"\n{Colors.YELLOW}[上下文管理] 当前 {current} tokens，超过预算 {token_budget}，开始裁剪...{Colors.ENDC}")
 
     summary = {
         "role": "user",
         "content": "[系统提示：之前的对话历史因上下文长度限制已被省略，请基于后续消息继续对话。]"
     }
 
-    keep_min = min(10, len(messages))
+    # 按比例估算需要保留的消息数
+    total_msgs = len(messages)
+    ratio = token_budget / current
+    keep_min = max(2, min(10, int(total_msgs * ratio)))
     trimmed = [summary] + messages[-keep_min:]
 
-    while estimate_tokens(trimmed, system_prompt) > token_budget and keep_min > 2:
+    # 如果保留太多仍可能超预算，逐步减少
+    while keep_min > 2 and len(trimmed) > 3:
         keep_min -= 2
         trimmed = [summary] + messages[-keep_min:]
 
@@ -799,7 +796,7 @@ def build_system_prompt() -> str:
         f"- CMD输出编码：{_encoding}\n"
         f"- Python：{_get_python_info()}\n"
         f"- 工作目录文件：{_get_cwd_files()}\n"
-        f"- 单次回复token上限：{config.get('api.max_tokens', 2048)}（超出会被截断，请控制每次回复长度）\n\n"
+        f"- 单次回复token上限：{config.get('api.max_tokens', 8192)}（超出会全部无效，请控制每次回复长度）\n\n"
         "工具使用规则：\n"
         "1. 使用标准 Windows CMD 语法（不是 PowerShell，不是 bash）\n"
         "2. 写入文件时，必须使用 write_file 工具，不要用 echo > 重定向\n"
@@ -808,9 +805,9 @@ def build_system_prompt() -> str:
         "5. cd 命令会持久改变工作目录，后续命令在新目录执行\n"
         "6. 读取文件内容用 read_file，不要用 bash + type\n"
         "7. 查看目录结构用 list_dir，搜索代码内容用 grep_search，比 bash 更稳定\n"
-        "8. 修改已有文件的局部内容，优先用 edit_file 精确修改；创建新文件或需要完整重写已有文件时，用 write_file 分批写入（第一次 mode=\"write\" 写前50行，后续 mode=\"append\" 每次追加不超过50行），绝对不要在一次 write_file 调用中写入超过50行\n"
-        "9. 文件操作前先用 list_dir 确认目标目录结构，避免在错误路径创建文件或重复嵌套目录（如在 test/ 里再建 test/）\n"
-        "10. 查询网页内容用 web_fetch，搜索互联网信息用 web_search\n"
+        "8. 修改已有文件的局部内容，优先用 edit_file 精确修改；创建新文件或需要完整重写已有文件时，用 write_file 分批写入\n"
+        "9. 查询网页内容用 web_fetch，搜索互联网信息用 web_search\n"
+        "10. 【严格遵守】write_file 每次调用 content 不得超过 4000 tokens（约 3000 字符），超长内容必须分批：首次 mode=\"write\"，后续 mode=\"append\"。edit_file 每次 old_string + new_string 总长不得超过 4000 tokens，大范围修改请拆分为多次调用。违反会导致输出截断、内容丢失！\n"
         "\n回复格式规则（终端可渲染Markdown）：\n"
         "- 使用中文回复\n"
         "- 使用 Markdown 格式回复（标题、列表、粗体、代码块等），终端会正确渲染\n"
@@ -824,7 +821,7 @@ def build_system_prompt() -> str:
 # ============================================================================
 
 def _print_stream_event_chat(event):
-    """chat 模式：工具调用时打印工具名，文本不实时打印（收集后统一渲染）"""
+    """chat 模式：工具调用时先打印工具名（执行阶段会用带参数的完整信息覆盖）"""
     if event.type == "content_block_start":
         block = event.content_block
         if block.type == "tool_use":
@@ -890,7 +887,7 @@ def stream_chat_response(model, all_tools, system_prompt, messages):
     try:
         with client.messages.stream(
             model=model,
-            max_tokens=config.get("api.max_tokens", 2048),
+            max_tokens=config.get("api.max_tokens", 8192),
             system=system_prompt,
             tools=all_tools,
             messages=messages,
@@ -939,6 +936,7 @@ def stream_chat_response(model, all_tools, system_prompt, messages):
             if hasattr(final_message, 'usage'):
                 token_stats["total_input"] += final_message.usage.input_tokens
                 token_stats["total_output"] += final_message.usage.output_tokens
+                token_stats["last_input"] = final_message.usage.input_tokens
             if _display_mode == 'json':
                 print_response(final_message, call_count)
             else:
@@ -959,7 +957,7 @@ def _fallback_non_stream(model, all_tools, system_prompt, messages):
     def api_call():
         return client.messages.create(
             model=model,
-            max_tokens=config.get("api.max_tokens", 2048),
+            max_tokens=config.get("api.max_tokens", 8192),
             system=system_prompt,
             tools=all_tools,
             messages=messages,
@@ -968,6 +966,7 @@ def _fallback_non_stream(model, all_tools, system_prompt, messages):
     if response and hasattr(response, 'usage'):
         token_stats["total_input"] += response.usage.input_tokens
         token_stats["total_output"] += response.usage.output_tokens
+        token_stats["last_input"] = response.usage.input_tokens
     if response:
         if _display_mode == 'json':
             print_response(response, call_count)
@@ -1025,6 +1024,7 @@ def chat(user_message: str, model: str = None) -> str:
         # --- 截断续传：max_tokens 时自动请求模型继续 ---
         if response.stop_reason == "max_tokens":
             safe_content = []
+
             for block in response.content:
                 if block.type == "text":
                     safe_content.append({"type": "text", "text": block.text})
@@ -1033,18 +1033,23 @@ def chat(user_message: str, model: str = None) -> str:
                         "type": "text",
                         "text": f"[工具调用 {block.name} 因长度限制被截断]"
                     })
+
             conversation_history.append({"role": "assistant", "content": safe_content})
             conversation_history.append({
                 "role": "user",
-                "content": "你的回复因长度限制被截断了。请从截断处继续，不要重复已输出的内容。如果工具调用被截断，请重新发起完整的工具调用。"
+                "content": "你的回复因长度限制被截断了，所有内容均失效，请重新输出，严禁单次输出超过3000字符; 如果工具调用被截断，请重新发起完整的工具调用。"
             })
+
+            # 收集被截断的工具名
+            truncated_tools = [b.name for b in response.content if b.type == "tool_use"]
 
             continuation_count += 1
             if continuation_count > max_continuation_retries:
                 print(f"  {Colors.YELLOW}⚠ 多次截断续传仍未完成，停止重试{Colors.ENDC}")
                 break
 
-            print(f"  {Colors.YELLOW}⚠ 输出被截断，自动请求继续...{Colors.ENDC}")
+            tool_info = f"（{', '.join(truncated_tools)}）" if truncated_tools else ""
+            print(f"  {Colors.YELLOW}⚠ 输出被截断{tool_info}（第{continuation_count}次续传），自动请求继续...{Colors.ENDC}")
             call_count += 1
             print_context(conversation_history, all_tools, call_count, model)
             response = _call_with_retry(model, all_tools, conversation_history)
@@ -1068,18 +1073,26 @@ def chat(user_message: str, model: str = None) -> str:
                     })
                     continue
 
+                # 构建命令/路径预览
+                cmd_preview = ""
+                if block.name == "bash" and isinstance(block.input, dict):
+                    cmd = block.input.get("command", "")
+                    first_line = cmd.split('\n')[0]
+                    cmd_preview = f": {first_line[:80]}{'...' if len(first_line) > 80 else ''}"
+                elif block.name in ("write_file", "read_file", "edit_file") and isinstance(block.input, dict):
+                    cmd_preview = f": {block.input.get('path', '')}"
+
                 if _display_mode == 'json':
-                    print(f"\n{Colors.BOLD}{Colors.CYAN}🔧 执行工具: {block.name}{Colors.ENDC}")
+                    print(f"\n{Colors.BOLD}{Colors.CYAN}🔧 执行工具: {block.name}{cmd_preview}{Colors.ENDC}")
                     print(f"{Colors.CYAN}   工作目录: {_cwd}{Colors.ENDC}")
                 else:
-                    # 先清除当前行（流式阶段可能已打印工具名），再重新打印
-                    print(f"\r{' ' * 80}\r  {Colors.CYAN}◆ {block.name}...{Colors.ENDC}", end='', flush=True)
+                    print(f"\r{' ' * 80}\r  {Colors.CYAN}◆ {block.name}{cmd_preview}{Colors.ENDC}", end='', flush=True)
                 tool_result = process_tool_call(block.name, block.input)
                 tool_result = truncate_tool_result(tool_result)
                 if _display_mode == 'json':
                     print(f"{Colors.GREEN}✓ 工具执行结果:{Colors.ENDC}\n{tool_result}\n")
                 else:
-                    print(f"\r{' ' * 80}\r  {Colors.GREEN}✓ {block.name}{Colors.ENDC}")
+                    print(f"\r{' ' * 80}\r  {Colors.GREEN}✓ {block.name}{cmd_preview}{Colors.ENDC}")
                 is_error = False
                 if block.name == "bash":
                     try:
