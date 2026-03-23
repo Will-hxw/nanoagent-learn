@@ -37,6 +37,7 @@ DEFAULTS = {
         "grep_search": {"enabled": True, "timeout": 45, "max_matches": 100, "max_file_size": 262144},
         "web_fetch":   {"enabled": True, "timeout": 30},
         "web_search":  {"enabled": True, "timeout": 30, "api_key": ""},
+        "understand_pdf": {"enabled": True, "timeout": 120},
     },
     "mcp_servers": [],
     "mcp_timeout": 30,

@@ -4,3 +4,4 @@ chardet==5.2.0
 mcp==1.26.0
 prompt_toolkit>=3.0.47,<4
 rich>=13.7,<14
+docling>=2.14.0

@@ -333,6 +333,22 @@ tools = [
             },
             "required": ["pattern"]
         }
+    },
+    {
+        "name": "understand_pdf",
+        "description": (
+            "理解和分析 PDF 文档内容，包括文字、图片、公式、表格等。"
+            "特别适合处理分栏排版的学术论文，能够保持正确的阅读顺序。"
+            "使用 Docling（IBM Research）引擎，支持复杂布局识别。"
+            "返回文档的结构化理解结果，包括统计信息和 Markdown 格式的内容。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "PDF 文件路径，相对路径基于当前工作目录"}
+            },
+            "required": ["path"]
+        }
     }
 ]
 
@@ -665,6 +681,69 @@ def execute_web_search(query: str, num_results: int = 15) -> str:
         return f"搜索错误: {str(e)}"
 
 
+def execute_understand_pdf(path: str) -> str:
+    """
+    理解 PDF 文档内容，包括文字、图片、公式、表格等。
+    先用 Docling 转换为 Markdown，然后返回结构化的理解结果。
+    """
+    try:
+        # 延迟导入，避免启动时加载
+        from docling.document_converter import DocumentConverter
+
+        full_path = path if os.path.isabs(path) else os.path.join(_cwd, path)
+        if not os.path.isfile(full_path):
+            return f"文件不存在: {full_path}"
+
+        # 检查文件大小（限制 100MB）
+        file_size = os.path.getsize(full_path)
+        if file_size > 100 * 1024 * 1024:
+            return f"文件过大: {file_size / 1024 / 1024:.1f}MB（限制 100MB）"
+
+        # 转换文档
+        converter = DocumentConverter()
+        result = converter.convert(full_path)
+
+        if result.status.name != "SUCCESS":
+            return f"转换失败: {result.status.name}"
+
+        # 导出为 Markdown
+        markdown_content = result.document.export_to_markdown()
+
+        # 构建理解结果
+        doc = result.document
+
+        # 统计信息
+        stats = {
+            "页数": len(doc.pages) if hasattr(doc, 'pages') else "未知",
+            "字符数": len(markdown_content),
+            "文件大小": f"{file_size / 1024:.1f}KB"
+        }
+
+        # 构建返回结果
+        output = []
+        output.append("=" * 80)
+        output.append("📄 PDF 文档理解结果")
+        output.append("=" * 80)
+        output.append("")
+        output.append("📊 文档统计:")
+        for k, v in stats.items():
+            output.append(f"  • {k}: {v}")
+        output.append("")
+        output.append("📝 文档内容（Markdown 格式）:")
+        output.append("-" * 80)
+        output.append(markdown_content)
+        output.append("-" * 80)
+        output.append("")
+        output.append("✅ 已成功理解文档内容，包括文字、表格、公式等元素")
+
+        return "\n".join(output)
+
+    except ImportError:
+        return "错误: docling 未安装，请运行: pip install docling"
+    except Exception as e:
+        return f"PDF 理解错误: {str(e)}"
+
+
 def run_with_timeout(func, timeout_seconds, tool_name="unknown"):
     """在子线程中执行工具函数，超时后返回错误"""
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -699,6 +778,8 @@ def process_tool_call(tool_name: str, tool_input: dict) -> str:
             return execute_web_fetch(tool_input["url"])
         if tool_name == "web_search":
             return execute_web_search(tool_input["query"], tool_input.get("num_results", 15))
+        if tool_name == "understand_pdf":
+            return execute_understand_pdf(tool_input["path"])
         if mcp_manager.is_mcp_tool(tool_name):
             return mcp_manager.call_tool(tool_name, tool_input)
         return "未知工具"
@@ -1228,6 +1309,7 @@ def main():
     print("  • 图片理解（MiniMAX MCP）")
     print("  • Markdown 渲染（rich 终端渲染，代码块语法高亮）")
     print("  • 多行输入（支持粘贴大段文本，Ctrl+Enter 换行，Enter 提交）")
+    print("  • PDF阅读理解与PDF转Markdown")
     mcp_tools = mcp_manager.get_tool_definitions()
     if mcp_tools:
         print(f"  • MCP 工具（{len(mcp_tools)} 个来自远程服务器，动态注册到工具列表）")
