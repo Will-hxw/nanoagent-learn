@@ -22,22 +22,32 @@ context:
   fallback_token_budget: 80000
   max_tool_result_chars: 30000
 
+# --- 全局工具超时（秒）---
+# 未单独配置 timeout 的工具使用此值
+tools_default_timeout: 60
+
 # --- 工具配置 ---
 # enabled: false 可禁用某个工具
+# timeout: 空闲超时(bash) 或固定超时(其他工具)
 tools:
   bash:
     enabled: true
     timeout: 30
   write_file:
     enabled: true
+    timeout: 30
   read_file:
     enabled: true
+    timeout: 30
   edit_file:
     enabled: true
+    timeout: 30
   list_dir:
     enabled: true
+    timeout: 15
   grep_search:
     enabled: true
+    timeout: 45
     max_matches: 100
     max_file_size: 262144    # 256KB
   web_fetch:

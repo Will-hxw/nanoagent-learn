@@ -51,9 +51,10 @@ def _find_config_path() -> str:
     """
     查找 config.yaml，优先级：
     1. 环境变量 AGENT_CONFIG
-    2. exe 所在目录（PyInstaller 打包后）
-    3. 脚本所在目录（开发时）
-    4. 当前工作目录
+    2. exe 所在目录（PyInstaller 打包后，允许外部覆盖）
+    3. 当前工作目录
+    4. PyInstaller _MEIPASS 临时目录（内嵌配置）
+    5. 脚本所在目录（开发时）
     """
     env_path = os.environ.get("AGENT_CONFIG")
     if env_path and os.path.isfile(env_path):
@@ -62,14 +63,20 @@ def _find_config_path() -> str:
     candidates = []
     if getattr(sys, 'frozen', False):
         candidates.append(os.path.dirname(sys.executable))
-    candidates.append(os.path.dirname(os.path.abspath(__file__)))
     candidates.append(os.getcwd())
+
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        candidates.append(meipass)
+
+    candidates.append(os.path.dirname(os.path.abspath(__file__)))
 
     for d in candidates:
         p = os.path.join(d, "config.yaml")
         if os.path.isfile(p):
             return p
     return None
+
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

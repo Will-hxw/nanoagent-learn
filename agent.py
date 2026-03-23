@@ -75,7 +75,7 @@ _encoding = locale.getpreferredencoding(False) or 'utf-8'
 _display_mode = config.get("display.mode", "chat")
 
 # 终端渲染和输入
-_rich_console = Console()
+_rich_console = Console(force_terminal=True, legacy_windows=False, color_system="auto")
 
 from prompt_toolkit.key_binding import KeyBindings
 _input_bindings = KeyBindings()
