@@ -1041,7 +1041,7 @@ def chat(user_message: str, model: str = None) -> str:
                 print(f"  {Colors.YELLOW}⚠ 多次截断续传仍未完成，停止重试{Colors.ENDC}")
                 break
 
-            tool_info = f"（{', '.join(truncated_tools)}）" if truncated_tools else ""
+            tool_info = f"（{', '.join(n for n in truncated_tools if n)}）" if truncated_tools else ""
             print(f"  {Colors.YELLOW}⚠ 输出被截断{tool_info}（第{continuation_count}次续传），自动请求继续...{Colors.ENDC}")
             call_count += 1
             print_context(conversation_history, all_tools, call_count, model)
@@ -1112,7 +1112,10 @@ def chat(user_message: str, model: str = None) -> str:
         if response is None:
             return ""
 
-    final_response = "".join(block.text for block in response.content if hasattr(block, "text"))
+    final_response = "".join(
+        block.text for block in response.content
+        if hasattr(block, "text") and block.text is not None
+    )
     if response.stop_reason == "max_tokens":
         final_response += "\n\n[注意：回复因长度限制被截断，可能不完整。]"
     conversation_history.append({"role": "assistant", "content": final_response})
