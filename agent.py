@@ -1292,8 +1292,24 @@ def main():
 
     # 连接 MCP 服务器（带加载动画）
     print(f"{Colors.BOLD}{Colors.CYAN}🔌 连接 MCP 服务器...{Colors.ENDC}")
-    show_loading_with_task(mcp_manager.init_servers)
+    mcp_init_summary = None
+    try:
+        mcp_init_summary = show_loading_with_task(mcp_manager.init_servers)
+    except Exception as e:
+        print(f"  {Colors.YELLOW}⚠ MCP 初始化异常，已跳过并进入对话模式: {e}{Colors.ENDC}")
     print()
+
+    if mcp_init_summary:
+        success_count = mcp_init_summary.get("success_count", 0)
+        failed = mcp_init_summary.get("failed", [])
+        if failed:
+            if success_count:
+                print(f"  {Colors.YELLOW}⚠ {len(failed)} 个 MCP 服务连接失败，已跳过{Colors.ENDC}")
+            else:
+                print(f"  {Colors.YELLOW}⚠ MCP 服务均不可用，已跳过并进入对话模式{Colors.ENDC}")
+            for item in failed:
+                print(f"    - {item['name']}: {item['reason']}")
+            print()
 
     print("\n功能说明：")
     print("  • 支持多轮对话，维护完整对话历史")

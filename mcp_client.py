@@ -6,6 +6,7 @@ MCP 客户端模块 - 管理远程 MCP 服务器连接和工具调用
 """
 
 import asyncio
+import concurrent.futures
 import threading
 import json
 import config
@@ -34,12 +35,20 @@ _mcp_thread.start()
 
 # 跨线程 print 锁，供 agent.py 导入使用
 print_lock = threading.Lock()
+_USE_CONFIG_TIMEOUT = object()
 
 
-def _run_async(coro):
+def _run_async(coro, timeout=_USE_CONFIG_TIMEOUT):
     """在后台事件循环中执行异步协程，同步等待结果"""
     future = asyncio.run_coroutine_threadsafe(coro, _mcp_loop)
-    return future.result(timeout=config.get("mcp_timeout", 30))
+    wait_timeout = config.get("mcp_timeout", 30) if timeout is _USE_CONFIG_TIMEOUT else timeout
+    try:
+        if wait_timeout is None:
+            return future.result()
+        return future.result(timeout=wait_timeout)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise
 
 
 # ============================================================================
@@ -59,38 +68,59 @@ class MCPManager:
 
     # ---- async 内部方法 ----
 
+    async def _cleanup_contexts(self, contexts: list):
+        """按相反顺序关闭本次尝试中创建的 context，避免重试时残留坏连接"""
+        for ctx in reversed(contexts):
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _format_error(exc: Exception) -> str:
+        if isinstance(exc, (asyncio.TimeoutError, concurrent.futures.TimeoutError)):
+            return f"连接超时（{config.get('mcp_timeout', 30)}s）"
+        message = str(exc).strip()
+        return message or exc.__class__.__name__
+
     async def _connect_server(self, srv_cfg: dict):
         """连接单个 MCP 服务器，发现工具"""
         name = srv_cfg["name"]
+        local_contexts = []
 
-        if srv_cfg.get("type") == "stdio":
-            params = StdioServerParameters(
-                command=srv_cfg["command"],
-                args=srv_cfg.get("args", []),
-                env=srv_cfg.get("env"),
-            )
-            transport_ctx = stdio_client(params)
-            read_stream, write_stream = await transport_ctx.__aenter__()
-        else:
-            url = srv_cfg["url"]
-            headers = srv_cfg["headers"]
-            transport_ctx = streamablehttp_client(url=url, headers=headers)
-            read_stream, write_stream, _ = await transport_ctx.__aenter__()
-        self._contexts.append(transport_ctx)
+        try:
+            if srv_cfg.get("type") == "stdio":
+                params = StdioServerParameters(
+                    command=srv_cfg["command"],
+                    args=srv_cfg.get("args", []),
+                    env=srv_cfg.get("env"),
+                )
+                transport_ctx = stdio_client(params)
+                read_stream, write_stream = await transport_ctx.__aenter__()
+            else:
+                url = srv_cfg["url"]
+                headers = srv_cfg["headers"]
+                transport_ctx = streamablehttp_client(url=url, headers=headers)
+                read_stream, write_stream, _ = await transport_ctx.__aenter__()
+            local_contexts.append(transport_ctx)
 
-        session_ctx = ClientSession(read_stream, write_stream)
-        session = await session_ctx.__aenter__()
-        self._contexts.append(session_ctx)
+            session_ctx = ClientSession(read_stream, write_stream)
+            session = await session_ctx.__aenter__()
+            local_contexts.append(session_ctx)
 
-        await session.initialize()
-        tools_response = await session.list_tools()
+            await session.initialize()
+            tools_response = await session.list_tools()
+        except BaseException:
+            await self._cleanup_contexts(local_contexts)
+            raise
 
+        self._contexts.extend(local_contexts)
         self.servers[name] = {
             "session": session,
             "tools": tools_response.tools,
         }
 
-        # 转换为 Anthropic 工具格式并注册路由
+        # 仅在连接完全成功后注册工具，避免失败重试产生重复路由
         for tool in tools_response.tools:
             prefixed = f"mcp_{name}__{tool.name}"
             self.tool_routing[prefixed] = name
@@ -102,21 +132,11 @@ class MCPManager:
 
         return tools_response.tools
 
-    async def _connect_all(self, configs: list):
-        """连接所有 MCP 服务器"""
-        for srv_cfg in configs:
-            name = srv_cfg["name"]
-            try:
-                tools = await self._connect_server(srv_cfg)
-                with print_lock:
-                    print(f"\r" + " " * 60 + "\r", end='')
-                    print(f"  \033[92m[OK] {name}: 已连接，发现 {len(tools)} 个工具\033[0m")
-                    for t in tools:
-                        print(f"    - mcp_{name}__{t.name}")
-            except Exception as e:
-                with print_lock:
-                    print(f"\r" + " " * 60 + "\r", end='')
-                    print(f"  \033[91m[FAIL] {name}: 连接失败 - {e}\033[0m")
+    async def _connect_server_with_timeout(self, srv_cfg: dict, timeout: int | None):
+        """对单个服务应用超时控制，超时后取消连接并让 _connect_server 执行清理"""
+        if timeout is None:
+            return await self._connect_server(srv_cfg)
+        return await asyncio.wait_for(self._connect_server(srv_cfg), timeout=timeout)
 
     async def _call_tool(self, prefixed_name: str, arguments: dict) -> str:
         """调用 MCP 工具"""
@@ -175,8 +195,57 @@ class MCPManager:
     # ---- 同步公开接口 ----
 
     def init_servers(self):
-        """启动时调用：连接所有 MCP 服务器"""
-        _run_async(self._connect_all(config.get_mcp_servers()))
+        """启动时调用：连接所有 MCP 服务器，失败时降级而不是中断启动"""
+        summary = {
+            "success_count": 0,
+            "failed_count": 0,
+            "connected": [],
+            "failed": [],
+        }
+        timeout = config.get("mcp_timeout", 30)
+
+        for srv_cfg in config.get_mcp_servers():
+            name = srv_cfg["name"]
+            last_error = None
+
+            for attempt in range(1, 3):
+                try:
+                    tools = _run_async(
+                        self._connect_server_with_timeout(srv_cfg, timeout),
+                        timeout=None,
+                    )
+                    summary["connected"].append({
+                        "name": name,
+                        "tool_count": len(tools),
+                    })
+                    with print_lock:
+                        print(f"\r" + " " * 60 + "\r", end='')
+                        print(f"  \033[92m[OK] {name}: 已连接，发现 {len(tools)} 个工具\033[0m")
+                        for t in tools:
+                            print(f"    - mcp_{name}__{t.name}")
+                    break
+                except Exception as e:
+                    last_error = e
+                    if attempt < 2:
+                        with print_lock:
+                            print(f"\r" + " " * 60 + "\r", end='')
+                            print(
+                                f"  \033[93m[RETRY] {name}: 第 {attempt}/2 次连接失败 - "
+                                f"{self._format_error(e)}，正在重试...\033[0m"
+                            )
+                    else:
+                        reason = self._format_error(e)
+                        summary["failed"].append({
+                            "name": name,
+                            "reason": reason,
+                        })
+                        with print_lock:
+                            print(f"\r" + " " * 60 + "\r", end='')
+                            print(f"  \033[91m[FAIL] {name}: 连接失败，已跳过 - {reason}\033[0m")
+
+        summary["success_count"] = len(summary["connected"])
+        summary["failed_count"] = len(summary["failed"])
+        return summary
 
     def get_tool_definitions(self) -> list:
         """返回 Anthropic 格式的 MCP 工具定义列表"""
