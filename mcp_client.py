@@ -77,11 +77,36 @@ class MCPManager:
                 pass
 
     @staticmethod
-    def _format_error(exc: Exception) -> str:
+    def _format_timeout(timeout: float | int | None) -> str:
+        if timeout is None:
+            return "unbounded"
+        if float(timeout).is_integer():
+            return str(int(timeout))
+        return f"{timeout:.1f}"
+
+    @classmethod
+    def _format_error(cls, exc: Exception, timeout: float | int | None = None) -> str:
         if isinstance(exc, (asyncio.TimeoutError, concurrent.futures.TimeoutError)):
-            return f"连接超时（{config.get('mcp_timeout', 30)}s）"
+            effective_timeout = config.get("mcp_timeout", 30) if timeout is None else timeout
+            return f"连接超时（{cls._format_timeout(effective_timeout)}s）"
         message = str(exc).strip()
         return message or exc.__class__.__name__
+
+    @staticmethod
+    def _get_attempt_timeout(
+        loop: asyncio.AbstractEventLoop,
+        per_server_timeout: float | int | None,
+        deadline: float | None,
+    ) -> float | int | None:
+        if deadline is None:
+            return per_server_timeout
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return 0
+        if per_server_timeout is None:
+            return remaining
+        return min(per_server_timeout, remaining)
 
     async def _connect_server(self, srv_cfg: dict):
         """连接单个 MCP 服务器，发现工具"""
@@ -137,6 +162,85 @@ class MCPManager:
         if timeout is None:
             return await self._connect_server(srv_cfg)
         return await asyncio.wait_for(self._connect_server(srv_cfg), timeout=timeout)
+
+    async def _connect_server_with_retries(
+        self,
+        srv_cfg: dict,
+        per_server_timeout: float | int | None,
+        deadline: float | None,
+    ) -> dict:
+        """在总预算内连接单个服务；并发执行，不让慢服务拖累整体启动"""
+        name = srv_cfg["name"]
+        loop = asyncio.get_running_loop()
+
+        for attempt in range(1, 3):
+            attempt_timeout = self._get_attempt_timeout(loop, per_server_timeout, deadline)
+            if attempt_timeout is not None and attempt_timeout <= 0:
+                reason = "启动预算耗尽"
+                with print_lock:
+                    print(f"\r" + " " * 60 + "\r", end='')
+                    print(f"  \033[91m[FAIL] {name}: 连接失败，已跳过 - {reason}\033[0m")
+                return {"name": name, "reason": reason}
+
+            try:
+                tools = await self._connect_server_with_timeout(srv_cfg, attempt_timeout)
+                with print_lock:
+                    print(f"\r" + " " * 60 + "\r", end='')
+                    print(f"  \033[92m[OK] {name}: 已连接，发现 {len(tools)} 个工具\033[0m")
+                    for t in tools:
+                        print(f"    - mcp_{name}__{t.name}")
+                return {
+                    "name": name,
+                    "tool_count": len(tools),
+                }
+            except Exception as e:
+                reason = self._format_error(e, attempt_timeout)
+                should_retry = (
+                    attempt < 2
+                    and not isinstance(e, (asyncio.TimeoutError, concurrent.futures.TimeoutError))
+                )
+                if should_retry:
+                    with print_lock:
+                        print(f"\r" + " " * 60 + "\r", end='')
+                        print(
+                            f"  \033[93m[RETRY] {name}: 第 {attempt}/2 次连接失败 - "
+                            f"{reason}，正在重试...\033[0m"
+                        )
+                    continue
+
+                with print_lock:
+                    print(f"\r" + " " * 60 + "\r", end='')
+                    print(f"  \033[91m[FAIL] {name}: 连接失败，已跳过 - {reason}\033[0m")
+                return {"name": name, "reason": reason}
+
+        return {"name": name, "reason": "未知错误"}
+
+    async def _connect_all(
+        self,
+        configs: list,
+        per_server_timeout: float | int | None,
+        startup_budget: float | int | None,
+    ) -> list[dict]:
+        """并发连接所有 MCP 服务，并用总预算约束整体启动时间"""
+        loop = asyncio.get_running_loop()
+        deadline = None if startup_budget is None else loop.time() + startup_budget
+        tasks = [
+            asyncio.create_task(
+                self._connect_server_with_retries(srv_cfg, per_server_timeout, deadline)
+            )
+            for srv_cfg in configs
+        ]
+
+        if not tasks:
+            return []
+
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     async def _call_tool(self, prefixed_name: str, arguments: dict) -> str:
         """调用 MCP 工具"""
@@ -203,45 +307,19 @@ class MCPManager:
             "failed": [],
         }
         timeout = config.get("mcp_timeout", 30)
+        startup_budget = config.get("mcp_startup_budget", timeout)
+        outer_timeout = None if startup_budget is None else startup_budget + 5
 
-        for srv_cfg in config.get_mcp_servers():
-            name = srv_cfg["name"]
-            last_error = None
+        results = _run_async(
+            self._connect_all(config.get_mcp_servers(), timeout, startup_budget),
+            timeout=outer_timeout,
+        )
 
-            for attempt in range(1, 3):
-                try:
-                    tools = _run_async(
-                        self._connect_server_with_timeout(srv_cfg, timeout),
-                        timeout=None,
-                    )
-                    summary["connected"].append({
-                        "name": name,
-                        "tool_count": len(tools),
-                    })
-                    with print_lock:
-                        print(f"\r" + " " * 60 + "\r", end='')
-                        print(f"  \033[92m[OK] {name}: 已连接，发现 {len(tools)} 个工具\033[0m")
-                        for t in tools:
-                            print(f"    - mcp_{name}__{t.name}")
-                    break
-                except Exception as e:
-                    last_error = e
-                    if attempt < 2:
-                        with print_lock:
-                            print(f"\r" + " " * 60 + "\r", end='')
-                            print(
-                                f"  \033[93m[RETRY] {name}: 第 {attempt}/2 次连接失败 - "
-                                f"{self._format_error(e)}，正在重试...\033[0m"
-                            )
-                    else:
-                        reason = self._format_error(e)
-                        summary["failed"].append({
-                            "name": name,
-                            "reason": reason,
-                        })
-                        with print_lock:
-                            print(f"\r" + " " * 60 + "\r", end='')
-                            print(f"  \033[91m[FAIL] {name}: 连接失败，已跳过 - {reason}\033[0m")
+        for item in results:
+            if "tool_count" in item:
+                summary["connected"].append(item)
+            else:
+                summary["failed"].append(item)
 
         summary["success_count"] = len(summary["connected"])
         summary["failed_count"] = len(summary["failed"])

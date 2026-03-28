@@ -41,6 +41,7 @@ DEFAULTS = {
     },
     "mcp_servers": [],
     "mcp_timeout": 30,
+    "mcp_startup_budget": 30,
 }
 
 

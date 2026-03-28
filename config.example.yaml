@@ -88,4 +88,7 @@ mcp_servers:
       MINIMAX_API_HOST: "https://api.minimaxi.com"
 
 # --- MCP 超时 ---
+# 单个 MCP 服务的连接超时（秒）
 mcp_timeout: 30
+# 启动阶段的 MCP 总预算（秒）；多个服务会并发连接，总耗时不会线性累加
+mcp_startup_budget: 30
