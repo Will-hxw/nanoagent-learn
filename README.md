@@ -1,4 +1,4 @@
-# Desktop Agent
+# nanoagent-learn
 
 <p align="center">
   <strong>Agent 基础架构学习</strong>
@@ -8,7 +8,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="MIT License"></a>
 </p>
 
-**Desktop Agent** 是一个用于学习 Agent 基础架构原理的终端 AI 助手。它完整展示了 Agent 的核心工作流程：用户输入 → API 请求 → 工具调用 → 结果反馈 → 循环直到完成。
+**nanoagent-learn** 是一个用于学习 Agent 基础架构原理的终端 AI 助手。它完整展示了 Agent 的核心工作流程：用户输入 → API 请求 → 工具调用 → 结果反馈 → 循环直到完成。
 
 ---
 
